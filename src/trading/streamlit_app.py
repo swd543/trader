@@ -581,6 +581,7 @@ async def download_and_ingest_files(
             client,
             files,
             output_dir,
+            max_concurrent=max_concurrent,
             job=job,
         )
         raise_if_job_cancelled(job)
@@ -625,42 +626,84 @@ async def plan_ingestion_work(
     files: list[MarketDataFile],
     output_dir: Path,
     *,
+    max_concurrent: int,
     job: DownloadJob,
 ) -> list[IngestWorkItem]:
     plan: list[IngestWorkItem] = []
     counts = {"aggregate": 0, "ingest_local": 0, "download": 0, "skipped": 0}
-    update_download_job(job, message="Checking existing raw trades and OHLCV", overall_text="Checking existing data")
+    semaphore = asyncio.Semaphore(max_concurrent)
+    completed = 0
+    total_files = len(files)
+    update_download_job(
+        job,
+        message="Checking existing raw trades and OHLCV",
+        overall_text=f"Checking existing data 0/{total_files}",
+        download_text="Planning work",
+    )
 
-    for trade_file in files:
-        raise_if_job_cancelled(job)
-        source_file = trade_file.csv_filename
-        status = await source_file_status(
-            engine,
-            provider=client.slug,
-            symbol=trade_file.symbol,
-            source_file=source_file,
-            trade_date=trade_file.trade_date,
-        )
-        local_path = output_dir / trade_file.symbol / source_file
+    async def classify_file(trade_file: MarketDataFile) -> tuple[IngestWorkItem | None, str]:
+        async with semaphore:
+            raise_if_job_cancelled(job)
+            source_file = trade_file.csv_filename
+            status = await source_file_status(
+                engine,
+                provider=client.slug,
+                symbol=trade_file.symbol,
+                source_file=source_file,
+                trade_date=trade_file.trade_date,
+            )
+            local_path = output_dir / trade_file.symbol / source_file
 
-        if status["trades"] and status["ohlcv"]:
-            counts["skipped"] += 1
-            update_download_file_row(job, trade_file, status="skipped", action="already complete", download_percent=100.0)
-        elif status["trades"]:
-            counts["aggregate"] += 1
-            plan.append(IngestWorkItem(trade_file=trade_file, action="aggregate"))
-            update_download_file_row(job, trade_file, status="queued", action=f"aggregate {BASE_OHLCV_TIMEFRAME} candles")
-        elif local_path.exists():
-            counts["ingest_local"] += 1
-            plan.append(IngestWorkItem(trade_file=trade_file, action="ingest_local", local_path=local_path))
-            update_download_file_row(job, trade_file, status="queued", action="ingest local csv")
-        else:
-            counts["download"] += 1
-            plan.append(IngestWorkItem(trade_file=trade_file, action="download"))
+            if status["trades"] and status["ohlcv"]:
+                update_download_file_row(job, trade_file, status="skipped", action="already complete", download_percent=100.0)
+                return None, "skipped"
+            if status["trades"]:
+                update_download_file_row(job, trade_file, status="queued", action=f"aggregate {BASE_OHLCV_TIMEFRAME} candles")
+                return IngestWorkItem(trade_file=trade_file, action="aggregate"), "aggregate"
+            if local_path.exists():
+                update_download_file_row(job, trade_file, status="queued", action="ingest local csv")
+                return IngestWorkItem(trade_file=trade_file, action="ingest_local", local_path=local_path), "ingest_local"
             update_download_file_row(job, trade_file, status="queued", action="download raw trades")
+            return IngestWorkItem(trade_file=trade_file, action="download"), "download"
+
+    tasks = [asyncio.create_task(classify_file(trade_file)) for trade_file in files]
+    try:
+        for task in asyncio.as_completed(tasks):
+            raise_if_job_cancelled(job)
+            work_item, count_key = await task
+            counts[count_key] += 1
+            if work_item is not None:
+                plan.append(work_item)
+            completed += 1
+            update_download_job(
+                job,
+                overall_fraction=completed / total_files,
+                overall_text=f"Checking existing data {completed}/{total_files}",
+                download_text=(
+                    f"Planning: aggregate={counts['aggregate']}, local ingest={counts['ingest_local']}, "
+                    f"download={counts['download']}, skipped={counts['skipped']}"
+                ),
+            )
+    except DownloadCancelled:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+    except Exception:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
 
     priority = {"aggregate": 0, "ingest_local": 1, "download": 2}
-    plan.sort(key=lambda item: (priority[item.action], item.trade_file.trade_date, item.trade_file.symbol, item.trade_file.filename))
+    plan.sort(
+        key=lambda item: (
+            priority[item.action],
+            item.trade_file.trade_date,
+            item.trade_file.symbol,
+            item.trade_file.filename,
+        )
+    )
     update_download_job(
         job,
         message=(

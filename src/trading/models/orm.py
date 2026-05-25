@@ -125,6 +125,7 @@ def trade_model_for_symbol(provider: str, symbol: str) -> type[BybitTradeModel]:
             "__table_args__": (
                 PrimaryKeyConstraint("trade_id", "ts"),
                 Index(f"{table_name}_ts_idx", "ts"),
+                Index(f"{table_name}_source_file_idx", "source_file"),
             ),
         },
     )

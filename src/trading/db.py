@@ -412,41 +412,76 @@ async def _ensure_symbol_schema(
     ohlcv_table = ohlcv_model.__tablename__
     tables = [cast(Table, trade_model.__table__), cast(Table, ohlcv_model.__table__)]
 
+    await _lock_symbol_schema(conn, normalized_provider, symbol)
     await conn.run_sync(lambda sync_conn: Base.metadata.create_all(sync_conn, tables=tables))
     await conn.execute(
         text("SELECT create_hypertable(CAST(:table_name AS text)::regclass, 'ts', if_not_exists => TRUE, migrate_data => TRUE)"),
         {"table_name": trades_table},
     )
+    await conn.execute(text(f"CREATE INDEX IF NOT EXISTS {trades_table}_source_file_idx ON {trades_table} (source_file)"))
     await conn.execute(
         text(
             "SELECT create_hypertable(CAST(:table_name AS text)::regclass, 'bucket', if_not_exists => TRUE, migrate_data => TRUE)"
         ),
         {"table_name": ohlcv_table},
     )
-    await conn.execute(
-        text(
-            f"""
-            ALTER TABLE {trades_table} SET (
-                timescaledb.compress,
-                timescaledb.compress_segmentby = 'symbol',
-                timescaledb.compress_orderby = 'ts DESC'
-            )
-            """
-        )
+    await _enable_compression_if_needed(
+        conn,
+        trades_table,
+        segment_by="symbol",
+        order_by="ts DESC",
     )
-    await conn.execute(
-        text(
-            f"""
-            ALTER TABLE {ohlcv_table} SET (
-                timescaledb.compress,
-                timescaledb.compress_segmentby = 'symbol',
-                timescaledb.compress_orderby = 'bucket DESC'
-            )
-            """
-        )
+    await _enable_compression_if_needed(
+        conn,
+        ohlcv_table,
+        segment_by="symbol",
+        order_by="bucket DESC",
     )
     await _add_compression_policy(conn, trades_table, compression_after)
     await _add_compression_policy(conn, ohlcv_table, compression_after)
+
+
+async def _lock_symbol_schema(conn: AsyncConnection, provider: str, symbol: str) -> None:
+    await conn.execute(
+        text("SELECT pg_advisory_xact_lock(hashtext(:lock_key)::bigint)"),
+        {"lock_key": f"trading:schema:{normalize_provider(provider)}:{normalize_symbol(symbol)}"},
+    )
+
+
+async def _enable_compression_if_needed(
+    conn: AsyncConnection,
+    table_name: str,
+    *,
+    segment_by: str,
+    order_by: str,
+) -> None:
+    compression_enabled = bool(
+        await conn.scalar(
+            text(
+                """
+                SELECT compression_enabled
+                FROM timescaledb_information.hypertables
+                WHERE hypertable_schema = 'public'
+                  AND hypertable_name = :table_name
+                """
+            ),
+            {"table_name": table_name},
+        )
+    )
+    if compression_enabled:
+        return
+
+    await conn.execute(
+        text(
+            f"""
+            ALTER TABLE {table_name} SET (
+                timescaledb.compress,
+                timescaledb.compress_segmentby = '{segment_by}',
+                timescaledb.compress_orderby = '{order_by}'
+            )
+            """
+        )
+    )
 
 
 async def _existing_symbols(conn: AsyncConnection, provider: str) -> list[str]:
