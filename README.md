@@ -21,3 +21,9 @@ uv run trading symbols --limit 10
 uv run trading files BTCUSDT --start-date 2020-03-25 --end-date 2020-03-26
 uv run trading -v download BTCUSDT --start-date 2020-03-25 --limit 1
 ```
+
+Start the Streamlit app:
+
+```sh
+uv run trading-app
+```

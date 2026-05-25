@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import date
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import BinaryIO
+from typing import BinaryIO, Callable
 from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
@@ -112,6 +112,7 @@ class BybitPublicDataClient:
         extract: bool = True,
         overwrite: bool = False,
         keep_archive: bool = False,
+        progress_callback: Callable[[int, int | None], None] | None = None,
     ) -> Path:
         """Download a trade file and return the final local path."""
         symbol_dir = Path(output_dir) / trade_file.symbol
@@ -128,7 +129,7 @@ class BybitPublicDataClient:
         else:
             logger.info("Downloading %s to %s", trade_file.url, archive_path)
             with self._open_binary(trade_file.url) as response, archive_path.open("wb") as output:
-                shutil.copyfileobj(response, output)
+                self._copy_response(response, output, progress_callback)
 
         if not extract or not trade_file.compressed:
             return archive_path
@@ -194,6 +195,26 @@ class BybitPublicDataClient:
     def _open_binary(self, url: str) -> BinaryIO:
         request = Request(url, headers={"User-Agent": self.user_agent})
         return urlopen(request, timeout=self.timeout)
+
+    @staticmethod
+    def _copy_response(
+        response: BinaryIO,
+        output: BinaryIO,
+        progress_callback: Callable[[int, int | None], None] | None,
+    ) -> None:
+        if progress_callback is None:
+            shutil.copyfileobj(response, output)
+            return
+
+        headers = getattr(response, "headers", {})
+        content_length = headers.get("Content-Length") if headers else None
+        total_bytes = int(content_length) if content_length else None
+        downloaded_bytes = 0
+
+        while chunk := response.read(1024 * 1024):
+            output.write(chunk)
+            downloaded_bytes += len(chunk)
+            progress_callback(downloaded_bytes, total_bytes)
 
     def _symbol_url(self, symbol: str) -> str:
         return urljoin(self.base_url, f"{symbol}/")

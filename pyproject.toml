@@ -7,10 +7,16 @@ authors = [
     { name = "swd543", email = "swapneel.datta@rabobank.nl" }
 ]
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "asyncpg>=0.31.0",
+    "pydantic>=2",
+    "sqlalchemy[asyncio]>=2.0",
+    "streamlit>=1.57.0",
+]
 
 [project.scripts]
 trading = "trading:main"
+trading-app = "trading.streamlit_launcher:main"
 
 [build-system]
 requires = ["uv_build>=0.11.16,<0.12.0"]
