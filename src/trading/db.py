@@ -14,6 +14,7 @@ from trading.models import (
     AggregateResult,
     ImportResult,
     OhlcvRow,
+    TradeMarkerRow,
     normalize_provider,
     normalize_symbol,
     ohlcv_table_prefix,
@@ -346,6 +347,49 @@ async def latest_ohlcv(
             rows.extend(OhlcvRow.model_validate(row._mapping) for row in result.all())
 
     return sorted(rows, key=lambda row: (row.bucket, row.symbol), reverse=True)
+
+
+async def latest_trade_markers(
+    engine: AsyncEngine,
+    *,
+    provider: str = "bybit",
+    symbol: str | None = None,
+    symbols: Sequence[str] | None = None,
+    limit: int = 500,
+) -> list[TradeMarkerRow]:
+    normalized_provider = normalize_provider(provider)
+    existing_symbols = set(await list_ingested_symbols(engine, provider=normalized_provider))
+    if symbol:
+        selected_symbols = [normalize_symbol(symbol)]
+    elif symbols:
+        selected_symbols = [normalize_symbol(item) for item in symbols]
+    else:
+        selected_symbols = sorted(existing_symbols)
+
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    rows: list[TradeMarkerRow] = []
+    async with session_factory() as session:
+        for selected_symbol in selected_symbols:
+            if selected_symbol not in existing_symbols:
+                continue
+            trade_model = trade_model_for_symbol(normalized_provider, selected_symbol)
+            statement = (
+                select(
+                    trade_model.ts,
+                    trade_model.symbol,
+                    trade_model.side,
+                    trade_model.size,
+                    trade_model.price,
+                    trade_model.trade_id,
+                    trade_model.source_file,
+                )
+                .order_by(trade_model.ts.desc())
+                .limit(limit)
+            )
+            result = await session.execute(statement)
+            rows.extend(TradeMarkerRow.model_validate(row._mapping) for row in result.all())
+
+    return sorted(rows, key=lambda row: (row.ts, row.symbol), reverse=True)
 
 
 async def list_ingested_symbols(engine: AsyncEngine, *, provider: str = "bybit") -> list[str]:

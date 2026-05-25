@@ -72,3 +72,13 @@ class OhlcvRow(FrozenModel):
     volume: float
     quote_volume: float | None
     trade_count: int
+
+
+class TradeMarkerRow(FrozenModel):
+    ts: datetime
+    symbol: str
+    side: str
+    size: float
+    price: float
+    trade_id: str
+    source_file: str

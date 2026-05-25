@@ -13,7 +13,7 @@ from trading.models.orm import (
     trade_table_prefix,
     trade_model_for_symbol,
 )
-from trading.models.schemas import AggregateResult, DatabaseConfig, ImportResult, OhlcvRow
+from trading.models.schemas import AggregateResult, DatabaseConfig, ImportResult, OhlcvRow, TradeMarkerRow
 
 __all__ = [
     "AggregateResult",
@@ -23,6 +23,7 @@ __all__ = [
     "DatabaseConfig",
     "ImportResult",
     "OhlcvRow",
+    "TradeMarkerRow",
     "normalize_provider",
     "normalize_symbol",
     "ohlcv_table_prefix",

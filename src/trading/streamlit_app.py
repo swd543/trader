@@ -7,21 +7,22 @@ import threading
 from collections.abc import Coroutine
 from contextlib import suppress
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date
 from pathlib import Path
-from typing import Any, Literal, TypedDict, cast
+from typing import Any, Literal, cast
 from uuid import uuid4
 
-import altair as alt
 import streamlit as st
 from sqlalchemy.exc import SQLAlchemyError
 
+from trading.charts import build_price_figure, normalize_ohlcv_chart_row, normalize_trade_marker_chart_row
 from trading.db import (
     BASE_OHLCV_TIMEFRAME,
     compress_old_chunks,
     ensure_schema,
     import_trade_csv,
     latest_ohlcv,
+    latest_trade_markers,
     source_file_status,
     table_counts,
     upsert_ohlcv_for_source,
@@ -63,17 +64,6 @@ class IngestWorkItem:
     local_path: Path | None = None
 
 
-class OhlcvChartRow(TypedDict):
-    bucket: str
-    symbol: str
-    open: float
-    high: float
-    low: float
-    close: float
-    volume: float
-    trade_count: int
-
-
 def main() -> None:
     st.set_page_config(page_title="Trading Data Loader", layout="wide")
     st.title("Trading Data Loader")
@@ -82,24 +72,18 @@ def main() -> None:
     provider_slug, provider_options = sidebar_provider_config()
     client = create_provider(provider_slug, **provider_options)
 
-    active_job = current_download_job()
-    if active_job is not None:
-        st.subheader("Download And Ingest")
-        render_download_job_status()
+    tickers_tab, download_tab, charts_tab = st.tabs(["Tickers", "Download And Ingest", "Charts"])
+
+    with tickers_tab:
+        show_database_status(db_config, client.slug)
         st.divider()
-        if download_job_is_running(active_job):
-            return
+        selected_symbols, start, end = ticker_explorer(client)
 
-    show_database_status(db_config, client.slug)
-    st.divider()
+    with download_tab:
+        download_panel(client, db_config, selected_symbols, start, end)
 
-    selected_symbols, start, end = ticker_explorer(client)
-    st.divider()
-
-    download_panel(client, db_config, selected_symbols, start, end)
-    st.divider()
-
-    ohlcv_panel(db_config, client.slug, selected_symbols)
+    with charts_tab:
+        ohlcv_panel(db_config, client.slug, selected_symbols)
 
 
 def sidebar_database_config() -> DatabaseConfig:
@@ -233,6 +217,11 @@ def download_panel(
     end: date,
 ) -> None:
     st.subheader("Download And Ingest")
+    active_job = current_download_job()
+    if active_job is not None:
+        render_download_job_status()
+        st.divider()
+
     options = st.columns([2, 1, 1, 1])
     with options[0]:
         output_dir = Path(st.text_input("Output directory", value=f"data/{client.slug}"))
@@ -244,7 +233,6 @@ def download_panel(
         compress_after = st.checkbox("Compress old chunks", value=True)
     cleanup_files = st.checkbox("Delete local files after ingest", value=True)
 
-    active_job = current_download_job()
     job_running = active_job is not None and download_job_is_running(active_job)
     disabled = not selected_symbols or job_running
     if st.button("Start Download And Ingest", disabled=disabled, width="stretch"):
@@ -924,13 +912,17 @@ def ohlcv_panel(db_config: DatabaseConfig, provider_slug: str, selected_symbols:
         st.info("Select one or more tickers to view OHLCV.")
         return
 
-    controls = st.columns([2, 1, 1])
+    controls = st.columns([2, 1, 1, 1, 1])
     with controls[0]:
         symbol = st.selectbox("Symbol", options=["", *selected_symbols], format_func=lambda value: value or "All selected")
     with controls[1]:
         timeframe = st.selectbox("Chart timeframe", options=TIMEFRAMES)
     with controls[2]:
         y_axis = st.segmented_control("Y axis", options=("Linear", "Log"), default="Linear")
+    with controls[3]:
+        layout_mode = st.segmented_control("Layout", options=("Overlay", "Stacked"), default="Overlay")
+    with controls[4]:
+        show_trades = st.checkbox("Trades", value=True)
 
     limit_key = ohlcv_limit_key(provider_slug, symbol or None, selected_symbols, timeframe)
     row_limit = ohlcv_row_limit(limit_key)
@@ -957,7 +949,23 @@ def ohlcv_panel(db_config: DatabaseConfig, provider_slug: str, selected_symbols:
                 limit=int(row_limit),
             )
         )
-        render_ohlcv_chart(rows, y_axis=str(y_axis or "Linear"))
+        trade_rows: list[dict[str, object]] = []
+        if show_trades:
+            trade_rows = run_async(
+                fetch_trade_markers(
+                    db_config,
+                    provider_slug=provider_slug,
+                    symbol=symbol or None,
+                    symbols=selected_symbols,
+                    limit=1_000,
+                )
+            )
+        render_ohlcv_chart(
+            rows,
+            trade_rows=trade_rows,
+            y_axis=str(y_axis or "Linear"),
+            layout_mode=str(layout_mode or "Overlay"),
+        )
         st.dataframe(rows, width="stretch", hide_index=True)
     except SQLAlchemyError as error:
         st.info(f"OHLCV unavailable: {error}")
@@ -975,7 +983,13 @@ def ohlcv_row_limit(limit_key: str) -> int:
     return min(max(value, 100), MAX_CHART_ROWS)
 
 
-def render_ohlcv_chart(rows: list[dict[str, object]], *, y_axis: str) -> None:
+def render_ohlcv_chart(
+    rows: list[dict[str, object]],
+    *,
+    trade_rows: list[dict[str, object]],
+    y_axis: str,
+    layout_mode: str,
+) -> None:
     if not rows:
         st.info("No OHLCV rows found for the selected tickers and timeframe.")
         return
@@ -988,45 +1002,14 @@ def render_ohlcv_chart(rows: list[dict[str, object]], *, y_axis: str) -> None:
             st.info("Log scale requires positive close prices.")
             return
 
-    y_scale_type: Literal["linear", "log"] = "log" if y_axis == "Log" else "linear"
-    bucket_count = len({str(row["bucket"]) for row in chart_rows})
-    chart_width = max(900, min(24_000, bucket_count * 10))
-    chart = (
-        alt.Chart(alt.Data(values=chart_rows))
-        .mark_line()
-        .encode(
-            x=alt.X("bucket:T", title="Time"),
-            y=alt.Y("close:Q", title="Close", scale=alt.Scale(type=y_scale_type, zero=False)),
-            color=alt.Color("symbol:N", title="Symbol"),
-            tooltip=[
-                alt.Tooltip("bucket:T", title="Time"),
-                alt.Tooltip("symbol:N", title="Symbol"),
-                alt.Tooltip("open:Q", title="Open", format=",.6f"),
-                alt.Tooltip("high:Q", title="High", format=",.6f"),
-                alt.Tooltip("low:Q", title="Low", format=",.6f"),
-                alt.Tooltip("close:Q", title="Close", format=",.6f"),
-                alt.Tooltip("volume:Q", title="Volume", format=",.4f"),
-                alt.Tooltip("trade_count:Q", title="Trades", format=","),
-            ],
-        )
-        .properties(width=chart_width, height=420)
-        .interactive()
+    trade_chart_rows = [normalize_trade_marker_chart_row(row) for row in trade_rows]
+    figure = build_price_figure(
+        chart_rows,
+        trade_chart_rows,
+        y_axis=y_axis,
+        layout_mode=layout_mode,
     )
-    st.altair_chart(chart, width=chart_width)
-
-
-def normalize_ohlcv_chart_row(row: dict[str, object]) -> OhlcvChartRow:
-    bucket = row["bucket"]
-    return {
-        "bucket": bucket.isoformat() if isinstance(bucket, datetime) else str(bucket),
-        "symbol": str(row["symbol"]),
-        "open": float(cast(str | int | float, row["open"])),
-        "high": float(cast(str | int | float, row["high"])),
-        "low": float(cast(str | int | float, row["low"])),
-        "close": float(cast(str | int | float, row["close"])),
-        "volume": float(cast(str | int | float, row["volume"])),
-        "trade_count": int(cast(str | int | float, row["trade_count"])),
-    }
+    st.plotly_chart(figure, width="stretch", config={"scrollZoom": True, "displaylogo": False})
 
 
 async def initialize_schema(db_config: DatabaseConfig, provider_slug: str) -> None:
@@ -1073,6 +1056,29 @@ async def fetch_latest_ohlcv(
             symbol=symbol,
             symbols=symbols,
             timeframe=timeframe,
+            limit=limit,
+        )
+        return [row.model_dump() for row in rows]
+    finally:
+        await engine.dispose()
+
+
+async def fetch_trade_markers(
+    db_config: DatabaseConfig,
+    *,
+    provider_slug: str,
+    symbol: str | None,
+    symbols: list[str],
+    limit: int,
+) -> list[dict[str, object]]:
+    engine = db_config.create_engine()
+    try:
+        await ensure_schema(engine, provider=provider_slug)
+        rows = await latest_trade_markers(
+            engine,
+            provider=provider_slug,
+            symbol=symbol,
+            symbols=symbols,
             limit=limit,
         )
         return [row.model_dump() for row in rows]

@@ -767,6 +767,19 @@ wheels = [
 ]
 
 [[package]]
+name = "plotly"
+version = "6.7.0"
+source = { registry = "https://nexus3.rabobank.nl/repository/pypi-proxy/simple" }
+dependencies = [
+    { name = "narwhals" },
+    { name = "packaging" },
+]
+sdist = { url = "https://nexus3.rabobank.nl/repository/pypi-proxy/packages/plotly/6.7.0/plotly-6.7.0.tar.gz", hash = "sha256:45eea0ff27e2a23ccd62776f77eb43aa1ca03df4192b76036e380bb479b892c6" }
+wheels = [
+    { url = "https://nexus3.rabobank.nl/repository/pypi-proxy/packages/plotly/6.7.0/plotly-6.7.0-py3-none-any.whl", hash = "sha256:ac8aca1c25c663a59b5b9140a549264a5badde2e057d79b8c772ae2920e32ff0" },
+]
+
+[[package]]
 name = "pluggy"
 version = "1.6.0"
 source = { registry = "https://nexus3.rabobank.nl/repository/pypi-proxy/simple" }
@@ -1202,9 +1215,9 @@ name = "trading"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
-    { name = "altair" },
     { name = "asyncpg" },
     { name = "httpx" },
+    { name = "plotly" },
     { name = "pydantic" },
     { name = "sqlalchemy", extra = ["asyncio"] },
     { name = "streamlit" },
@@ -1219,9 +1232,9 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "altair", specifier = ">=6.1.0" },
     { name = "asyncpg", specifier = ">=0.31.0" },
     { name = "httpx", specifier = ">=0.28.1" },
+    { name = "plotly", specifier = ">=6.7.0" },
     { name = "pydantic", specifier = ">=2" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0" },
     { name = "streamlit", specifier = ">=1.57.0" },
