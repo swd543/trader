@@ -400,8 +400,24 @@ def run_download_job_worker(
 
 def current_download_job() -> DownloadJob | None:
     job = st.session_state.get(DOWNLOAD_JOB_KEY)
-    if isinstance(job, DownloadJob):
-        return job
+    required_attributes = (
+        "id",
+        "status",
+        "message",
+        "overall_fraction",
+        "overall_text",
+        "download_fraction",
+        "download_text",
+        "ingest_text",
+        "error",
+        "thread",
+        "lock",
+        "cancel_event",
+        "log_rows",
+        "file_rows",
+    )
+    if all(hasattr(job, attribute) for attribute in required_attributes):
+        return cast(DownloadJob, job)
     return None
 
 
