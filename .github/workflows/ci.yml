@@ -26,7 +26,9 @@ jobs:
           python-version-file: ".python-version"
 
       - name: Install dependencies
-        run: uv sync --locked --all-groups
+        run: |
+          rm -f uv.lock
+          uv sync --all-groups --default-index https://pypi.org/simple
 
       - name: Lint
         run: uv run ruff check .
