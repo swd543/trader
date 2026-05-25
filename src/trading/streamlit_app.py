@@ -175,14 +175,16 @@ def download_panel(
     end: date,
 ) -> None:
     st.subheader("Download And Ingest")
-    options = st.columns([2, 1, 1, 1])
+    options = st.columns([2, 1, 1, 1, 1])
     with options[0]:
         output_dir = Path(st.text_input("Output directory", value=f"data/{client.slug}"))
     with options[1]:
         timeframe = st.selectbox("OHLCV timeframe", options=TIMEFRAMES)
     with options[2]:
-        overwrite = st.checkbox("Overwrite files", value=False)
+        max_concurrent = st.number_input("Max concurrent files", min_value=1, max_value=8, value=8, step=1)
     with options[3]:
+        overwrite = st.checkbox("Overwrite files", value=False)
+    with options[4]:
         compress_after = st.checkbox("Compress old chunks", value=True)
 
     disabled = not selected_symbols
@@ -195,6 +197,7 @@ def download_panel(
             end,
             output_dir,
             timeframe,
+            max_concurrent=max_concurrent,
             overwrite=overwrite,
             compress_after=compress_after,
         )
@@ -209,6 +212,7 @@ def run_download_and_ingest(
     output_dir: Path,
     timeframe: str,
     *,
+    max_concurrent: int,
     overwrite: bool,
     compress_after: bool,
 ) -> None:
@@ -231,6 +235,7 @@ def run_download_and_ingest(
                 files,
                 output_dir,
                 timeframe,
+                max_concurrent=max_concurrent,
                 overwrite=overwrite,
                 compress_after=compress_after,
                 job_log=job_log,
@@ -263,6 +268,7 @@ async def download_and_ingest_files(
     output_dir: Path,
     timeframe: str,
     *,
+    max_concurrent: int,
     overwrite: bool,
     compress_after: bool,
     job_log: list[dict[str, Any]],
@@ -273,8 +279,31 @@ async def download_and_ingest_files(
 ) -> None:
     engine = db_config.create_engine()
     try:
-        await ensure_schema(engine, provider=client.slug)
+        await ensure_schema(engine, provider=client.slug, symbols=sorted({file.symbol for file in files}))
         total_files = len(files)
+        if max_concurrent > 1:
+            await download_and_ingest_concurrently(
+                client,
+                engine,
+                files,
+                output_dir,
+                timeframe,
+                max_concurrent=max_concurrent,
+                overwrite=overwrite,
+                job_log=job_log,
+                log_slot=log_slot,
+                overall_progress=overall_progress,
+                download_progress=download_progress,
+                ingest_slot=ingest_slot,
+            )
+            if compress_after:
+                compressed = await compress_old_chunks(engine, provider=client.slug, older_than="30 days")
+                st.info(
+                    "Compressed chunks: "
+                    f"trades={compressed['trades']}, ohlcv={compressed['ohlcv']}"
+                )
+            return
+
         for index, trade_file in enumerate(files, start=1):
             overall_progress.progress((index - 1) / total_files, text=f"{index}/{total_files}: {trade_file.filename}")
 
@@ -339,6 +368,69 @@ async def download_and_ingest_files(
             )
     finally:
         await engine.dispose()
+
+
+async def download_and_ingest_concurrently(
+    client: HistoricalTradeProvider,
+    engine: Any,
+    files: list[MarketDataFile],
+    output_dir: Path,
+    timeframe: str,
+    *,
+    max_concurrent: int,
+    overwrite: bool,
+    job_log: list[dict[str, Any]],
+    log_slot: Any,
+    overall_progress: Any,
+    download_progress: Any,
+    ingest_slot: Any,
+) -> None:
+    semaphore = asyncio.Semaphore(max_concurrent)
+    completed = 0
+    total_files = len(files)
+    overall_progress.progress(0, text=f"Running up to {max_concurrent} files at a time")
+
+    async def process_file(trade_file: MarketDataFile) -> dict[str, Any]:
+        async with semaphore:
+            path = await asyncio.to_thread(
+                client.download_trade_file,
+                trade_file,
+                output_dir,
+                overwrite=overwrite,
+            )
+            import_result = await import_trade_csv(
+                engine,
+                path,
+                provider=client.slug,
+                symbol=trade_file.symbol,
+                row_iterator=client.iter_trade_rows,
+            )
+            aggregate_result = await upsert_ohlcv_for_source(
+                engine,
+                import_result.source_file,
+                provider=client.slug,
+                symbol=import_result.symbol,
+                timeframe=timeframe,
+            )
+            return {
+                "file": trade_file.filename,
+                "raw_rows": import_result.rows_read,
+                "inserted_rows": import_result.rows_inserted,
+                "ohlcv_rows": aggregate_result.rows_upserted,
+                "min_ts": import_result.min_ts,
+                "max_ts": import_result.max_ts,
+            }
+
+    tasks = [asyncio.create_task(process_file(trade_file)) for trade_file in files]
+    for task in asyncio.as_completed(tasks):
+        row = await task
+        completed += 1
+        job_log.append(row)
+        log_slot.dataframe(job_log, width="stretch", hide_index=True)
+        overall_progress.progress(completed / total_files, text=f"{completed}/{total_files}: complete")
+        download_progress.progress(completed / total_files, text=f"Completed {completed}/{total_files} files")
+
+    ingest_slot.success(f"Completed {completed:,} files with max concurrency {max_concurrent}.")
 
 
 def ohlcv_panel(db_config: DatabaseConfig, provider_slug: str, selected_symbols: list[str]) -> None:
