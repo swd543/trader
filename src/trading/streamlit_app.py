@@ -7,7 +7,7 @@ import threading
 from collections.abc import Coroutine
 from contextlib import suppress
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Literal, cast
 from uuid import uuid4
@@ -206,9 +206,9 @@ def ticker_explorer(client: HistoricalTradeProvider) -> tuple[list[str], date, d
     controls = st.columns([3, 1, 1])
     provider_options = provider_cache_options(client)
     with controls[1]:
-        start = st.date_input("Start", value=date(2020, 3, 25))
+        start = st.date_input("Start", value=date(2020, 1, 1))
     with controls[2]:
-        end = st.date_input("End", value=date(2020, 3, 26))
+        end = st.date_input("End", value=date.today())
 
     if st.button("Refresh Tickers"):
         cached_symbols.clear()
@@ -504,10 +504,15 @@ def update_download_file_row(
     downloaded_bytes: int | None = None,
     total_bytes: int | None = None,
     download_percent: float | None = None,
+    raw_rows: int | None = None,
+    inserted_rows: int | None = None,
+    ohlcv_rows: int | None = None,
 ) -> None:
     with job.lock:
         row = job.file_rows.setdefault(trade_file.filename, download_file_row(trade_file, index=len(job.file_rows) + 1, status=status))
         row["status"] = status
+        if status == "completed" and not row.get("completed_at"):
+            row["completed_at"] = completion_timestamp()
         if action is not None:
             row["action"] = action
         if downloaded_bytes is not None:
@@ -518,6 +523,12 @@ def update_download_file_row(
             row["download_percent"] = download_percent
         elif total_bytes:
             row["download_percent"] = round((downloaded_bytes or 0) / total_bytes * 100, 1)
+        if raw_rows is not None:
+            row["raw_rows"] = raw_rows
+        if inserted_rows is not None:
+            row["inserted_rows"] = inserted_rows
+        if ohlcv_rows is not None:
+            row["ohlcv_rows"] = ohlcv_rows
 
 
 def mark_unfinished_download_files(job: DownloadJob, status: str) -> None:
@@ -539,6 +550,10 @@ def download_file_row(trade_file: MarketDataFile, *, index: int, status: str) ->
         "download_percent": 0.0,
         "downloaded_bytes": 0,
         "total_bytes": None,
+        "raw_rows": None,
+        "inserted_rows": None,
+        "ohlcv_rows": None,
+        "completed_at": "",
     }
 
 
@@ -597,6 +612,7 @@ def render_download_job_status() -> None:
 
     file_rows = cast(list[dict[str, Any]], snapshot["file_rows"])
     if file_rows:
+        render_download_job_row_totals(file_rows)
         completed_statuses = {"completed", "skipped"}
         active_file_rows = [row for row in file_rows if row["status"] not in completed_statuses]
         completed_file_rows = [row for row in file_rows if row["status"] in completed_statuses]
@@ -610,6 +626,28 @@ def render_download_job_status() -> None:
     log_rows = cast(list[dict[str, Any]], snapshot["log_rows"])
     if log_rows:
         st.dataframe(log_rows, width="stretch", hide_index=True)
+
+
+def render_download_job_row_totals(rows: list[dict[str, Any]]) -> None:
+    raw_rows = sum_int_values(rows, "raw_rows")
+    inserted_rows = sum_int_values(rows, "inserted_rows")
+    ohlcv_rows = sum_int_values(rows, "ohlcv_rows")
+    if raw_rows == 0 and inserted_rows == 0 and ohlcv_rows == 0:
+        return
+
+    columns = st.columns(3)
+    columns[0].metric("Trades read", f"{raw_rows:,}")
+    columns[1].metric("Trades inserted", f"{inserted_rows:,}")
+    columns[2].metric("OHLCV rows", f"{ohlcv_rows:,}")
+
+
+def sum_int_values(rows: list[dict[str, Any]], key: str) -> int:
+    total = 0
+    for row in rows:
+        value = row.get(key)
+        if isinstance(value, int):
+            total += value
+    return total
 
 
 def render_download_file_rows(rows: list[dict[str, Any]]) -> None:
@@ -626,6 +664,10 @@ def render_download_file_rows(rows: list[dict[str, Any]]) -> None:
             "download_percent",
             "downloaded_bytes",
             "total_bytes",
+            "raw_rows",
+            "inserted_rows",
+            "ohlcv_rows",
+            "completed_at",
         ),
         column_config={
             "download_percent": st.column_config.ProgressColumn(
@@ -636,6 +678,10 @@ def render_download_file_rows(rows: list[dict[str, Any]]) -> None:
             ),
             "downloaded_bytes": st.column_config.NumberColumn("Downloaded bytes", format="%d"),
             "total_bytes": st.column_config.NumberColumn("Total bytes", format="%d"),
+            "raw_rows": st.column_config.NumberColumn("Trades read", format="%d"),
+            "inserted_rows": st.column_config.NumberColumn("Trades inserted", format="%d"),
+            "ohlcv_rows": st.column_config.NumberColumn("OHLCV rows", format="%d"),
+            "completed_at": st.column_config.TextColumn("Completed at"),
         },
     )
 
@@ -643,6 +689,10 @@ def render_download_file_rows(rows: list[dict[str, Any]]) -> None:
 def raise_if_job_cancelled(job: DownloadJob) -> None:
     if job.cancel_event.is_set():
         raise DownloadCancelled("Download job cancelled")
+
+
+def completion_timestamp() -> str:
+    return datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
 async def collect_trade_files(
@@ -830,7 +880,13 @@ async def aggregate_existing_source(
         trade_date=trade_file.trade_date,
         ensure_symbol_schema=False,
     )
-    update_download_file_row(job, trade_file, status="completed", download_percent=100.0)
+    update_download_file_row(
+        job,
+        trade_file,
+        status="completed",
+        download_percent=100.0,
+        ohlcv_rows=aggregate_result.rows_upserted,
+    )
     return {
         "file": trade_file.csv_filename,
         "action": "aggregate",
@@ -895,7 +951,15 @@ async def import_and_aggregate_source(
     )
     raise_if_job_cancelled(job)
     local_file_deleted = cleanup_downloaded_file(path, output_dir) if cleanup_files else False
-    update_download_file_row(job, trade_file, status="completed", download_percent=100.0)
+    update_download_file_row(
+        job,
+        trade_file,
+        status="completed",
+        download_percent=100.0,
+        raw_rows=import_result.rows_read,
+        inserted_rows=import_result.rows_inserted,
+        ohlcv_rows=aggregate_result.rows_upserted,
+    )
     return {
         "file": trade_file.filename,
         "action": action,
@@ -1261,9 +1325,9 @@ def provider_kwargs(options: tuple[tuple[str, object], ...]) -> dict[str, object
 
 
 def default_symbols(symbols: list[str]) -> list[str]:
-    if "BTCUSDT" in symbols:
-        return ["BTCUSDT"]
-    return symbols[:1]
+    preferred_symbols = ("BTCUSD", "SOLUSD", "XRPUSD", "ETHUSD")
+    defaults = [symbol for symbol in preferred_symbols if symbol in symbols]
+    return defaults or symbols[:1]
 
 
 @st.cache_data(ttl=3600)
