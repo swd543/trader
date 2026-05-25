@@ -106,6 +106,7 @@ def build_price_figure(
                 figure.add_trace(marker_trace)
 
     figure.update_layout(
+        dragmode="pan",
         height=max(480, 320 * len(symbols)) if stacked else 560,
         margin={"l": 40, "r": 24, "t": 48, "b": 40},
         hovermode="x unified",

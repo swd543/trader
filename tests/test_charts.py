@@ -35,6 +35,7 @@ def test_build_price_figure_can_overlay_trade_markers() -> None:
     assert len(figure.data) == 2
     assert figure.data[0].type == "candlestick"
     assert figure.data[1].type == "scattergl"
+    assert figure.layout.dragmode == "pan"
 
 
 def test_build_price_figure_can_stack_multiple_symbols() -> None:

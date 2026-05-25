@@ -1102,7 +1102,16 @@ def render_ohlcv_chart(
         y_axis=y_axis,
         layout_mode=layout_mode,
     )
-    st.plotly_chart(figure, width="stretch", config={"scrollZoom": True, "displaylogo": False})
+    st.plotly_chart(
+        figure,
+        width="stretch",
+        config={
+            "scrollZoom": True,
+            "displaylogo": False,
+            "displayModeBar": "hover",
+            "doubleClick": "reset",
+        },
+    )
 
 
 async def initialize_schema(db_config: DatabaseConfig, provider_slug: str) -> None:
