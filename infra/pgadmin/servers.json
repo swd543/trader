@@ -1,0 +1,16 @@
+{
+  "Servers": {
+    "1": {
+      "Name": "TimescaleDB",
+      "Group": "Trading",
+      "Host": "timescaledb",
+      "Port": 5432,
+      "MaintenanceDB": "trading",
+      "Username": "postgres",
+      "Password": "postgres",
+      "SavePassword": true,
+      "SSLMode": "prefer",
+      "Comment": "TimescaleDB service from docker-compose.yml"
+    }
+  }
+}

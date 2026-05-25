@@ -1,12 +1,12 @@
 services:
   timescaledb:
     image: timescale/timescaledb:latest-pg16
-    container_name: trader-timescaledb
+    container_name: trading-timescaledb
     restart: unless-stopped
     environment:
-      POSTGRES_DB: ${POSTGRES_DB:-trader}
-      POSTGRES_USER: ${POSTGRES_USER:-trader}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-trader}
+      POSTGRES_DB: ${POSTGRES_DB:-trading}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
       PGDATA: /var/lib/postgresql/data/pgdata
     ports:
       - "${POSTGRES_PORT:-5432}:5432"
@@ -21,7 +21,7 @@ services:
 
   pgadmin:
     image: dpage/pgadmin4:latest
-    container_name: trader-pgadmin
+    container_name: trading-pgadmin
     restart: unless-stopped
     depends_on:
       timescaledb:
@@ -31,6 +31,7 @@ services:
       PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-admin}
       PGADMIN_CONFIG_SERVER_MODE: "False"
       PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED: "False"
+      PGADMIN_REPLACE_SERVERS_ON_STARTUP: "True"
     ports:
       - "${PGADMIN_PORT:-5050}:80"
     volumes:

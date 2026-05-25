@@ -12,5 +12,4 @@ wheels/
 
 # Local persistent
 data
-infra
 *.log
