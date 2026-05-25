@@ -1,3 +1,9 @@
+"""Provider registry.
+
+Add a provider implementation by subclassing HistoricalTradeProvider and
+registering the class in PROVIDERS with its stable slug.
+"""
+
 from typing import Any
 
 from trading.providers.base import HistoricalTradeProvider, MarketDataFile, ProviderOption, TradeRow
