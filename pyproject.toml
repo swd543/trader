@@ -8,6 +8,7 @@ authors = [
 ]
 requires-python = ">=3.13"
 dependencies = [
+    "altair>=6.1.0",
     "asyncpg>=0.31.0",
     "pydantic>=2",
     "sqlalchemy[asyncio]>=2.0",

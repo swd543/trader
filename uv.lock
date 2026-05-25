@@ -1174,6 +1174,7 @@ name = "trading"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "altair" },
     { name = "asyncpg" },
     { name = "pydantic" },
     { name = "sqlalchemy", extra = ["asyncio"] },
@@ -1189,6 +1190,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "altair", specifier = ">=6.1.0" },
     { name = "asyncpg", specifier = ">=0.31.0" },
     { name = "pydantic", specifier = ">=2" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0" },

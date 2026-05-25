@@ -274,6 +274,7 @@ async def latest_ohlcv(
     provider: str = "bybit",
     symbol: str | None = None,
     symbols: Sequence[str] | None = None,
+    timeframe: str | None = None,
     limit: int = 200,
 ) -> list[OhlcvRow]:
     normalized_provider = normalize_provider(provider)
@@ -292,11 +293,10 @@ async def latest_ohlcv(
             if selected_symbol not in existing_symbols:
                 continue
             ohlcv_model = ohlcv_model_for_symbol(normalized_provider, selected_symbol)
-            statement = (
-                select(ohlcv_model)
-                .order_by(ohlcv_model.bucket.desc(), ohlcv_model.symbol)
-                .limit(limit)
-            )
+            statement = select(ohlcv_model)
+            if timeframe is not None:
+                statement = statement.where(ohlcv_model.timeframe == timeframe)
+            statement = statement.order_by(ohlcv_model.bucket.desc(), ohlcv_model.symbol).limit(limit)
             symbol_rows = (await session.scalars(statement)).all()
             rows.extend(OhlcvRow.model_validate(row) for row in symbol_rows)
 

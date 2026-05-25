@@ -3,10 +3,12 @@ from __future__ import annotations
 import os
 import asyncio
 from collections.abc import Coroutine
-from datetime import date
+from contextlib import suppress
+from datetime import date, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, TypedDict, cast
 
+import altair as alt
 import streamlit as st
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -22,6 +24,18 @@ from trading.models import DatabaseConfig
 from trading.providers import HistoricalTradeProvider, MarketDataFile, create_provider, provider_names
 
 TIMEFRAMES = ("1 minute", "5 minutes", "15 minutes", "1 hour", "1 day")
+
+
+class OhlcvChartRow(TypedDict):
+    bucket: str
+    symbol: str
+    timeframe: str
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+    trade_count: int
 
 
 def main() -> None:
@@ -186,6 +200,7 @@ def download_panel(
         overwrite = st.checkbox("Overwrite files", value=False)
     with options[4]:
         compress_after = st.checkbox("Compress old chunks", value=True)
+    cleanup_files = st.checkbox("Delete local files after ingest", value=True)
 
     disabled = not selected_symbols
     if st.button("Start Download And Ingest", disabled=disabled, width="stretch"):
@@ -200,6 +215,7 @@ def download_panel(
             max_concurrent=max_concurrent,
             overwrite=overwrite,
             compress_after=compress_after,
+            cleanup_files=cleanup_files,
         )
 
 
@@ -215,6 +231,7 @@ def run_download_and_ingest(
     max_concurrent: int,
     overwrite: bool,
     compress_after: bool,
+    cleanup_files: bool,
 ) -> None:
     job_log: list[dict[str, Any]] = []
     log_slot = st.empty()
@@ -238,6 +255,7 @@ def run_download_and_ingest(
                 max_concurrent=max_concurrent,
                 overwrite=overwrite,
                 compress_after=compress_after,
+                cleanup_files=cleanup_files,
                 job_log=job_log,
                 log_slot=log_slot,
                 overall_progress=overall_progress,
@@ -271,6 +289,7 @@ async def download_and_ingest_files(
     max_concurrent: int,
     overwrite: bool,
     compress_after: bool,
+    cleanup_files: bool,
     job_log: list[dict[str, Any]],
     log_slot: Any,
     overall_progress: Any,
@@ -290,6 +309,7 @@ async def download_and_ingest_files(
                 timeframe,
                 max_concurrent=max_concurrent,
                 overwrite=overwrite,
+                cleanup_files=cleanup_files,
                 job_log=job_log,
                 log_slot=log_slot,
                 overall_progress=overall_progress,
@@ -346,6 +366,7 @@ async def download_and_ingest_files(
                 f"Inserted {import_result.rows_inserted:,}/{import_result.rows_read:,} raw rows; "
                 f"upserted {aggregate_result.rows_upserted:,} OHLCV rows"
             )
+            local_file_deleted = cleanup_downloaded_file(path, output_dir) if cleanup_files else False
 
             job_log.append(
                 {
@@ -355,6 +376,7 @@ async def download_and_ingest_files(
                     "ohlcv_rows": aggregate_result.rows_upserted,
                     "min_ts": import_result.min_ts,
                     "max_ts": import_result.max_ts,
+                    "local_file_deleted": local_file_deleted,
                 }
             )
             log_slot.dataframe(job_log, width="stretch", hide_index=True)
@@ -379,6 +401,7 @@ async def download_and_ingest_concurrently(
     *,
     max_concurrent: int,
     overwrite: bool,
+    cleanup_files: bool,
     job_log: list[dict[str, Any]],
     log_slot: Any,
     overall_progress: Any,
@@ -412,6 +435,7 @@ async def download_and_ingest_concurrently(
                 symbol=import_result.symbol,
                 timeframe=timeframe,
             )
+            local_file_deleted = cleanup_downloaded_file(path, output_dir) if cleanup_files else False
             return {
                 "file": trade_file.filename,
                 "raw_rows": import_result.rows_read,
@@ -419,6 +443,7 @@ async def download_and_ingest_concurrently(
                 "ohlcv_rows": aggregate_result.rows_upserted,
                 "min_ts": import_result.min_ts,
                 "max_ts": import_result.max_ts,
+                "local_file_deleted": local_file_deleted,
             }
 
     tasks = [asyncio.create_task(process_file(trade_file)) for trade_file in files]
@@ -433,16 +458,113 @@ async def download_and_ingest_concurrently(
     ingest_slot.success(f"Completed {completed:,} files with max concurrency {max_concurrent}.")
 
 
+def cleanup_downloaded_file(path: Path, output_dir: Path) -> bool:
+    output_root = output_dir.resolve()
+    target = path.resolve()
+    try:
+        target.relative_to(output_root)
+    except ValueError:
+        return False
+
+    deleted = False
+    with suppress(FileNotFoundError):
+        target.unlink()
+        deleted = True
+
+    parent = target.parent
+    while parent != output_root and output_root in parent.parents:
+        with suppress(OSError):
+            parent.rmdir()
+        parent = parent.parent
+
+    return deleted
+
+
 def ohlcv_panel(db_config: DatabaseConfig, provider_slug: str, selected_symbols: list[str]) -> None:
     st.subheader("OHLCV")
-    symbol = st.selectbox("Symbol", options=["", *selected_symbols], format_func=lambda value: value or "All selected")
+    if not selected_symbols:
+        st.info("Select one or more tickers to view OHLCV.")
+        return
+
+    controls = st.columns([2, 1, 1, 1])
+    with controls[0]:
+        symbol = st.selectbox("Symbol", options=["", *selected_symbols], format_func=lambda value: value or "All selected")
+    with controls[1]:
+        timeframe = st.selectbox("Chart timeframe", options=TIMEFRAMES)
+    with controls[2]:
+        y_axis = st.segmented_control("Y axis", options=("Linear", "Log"), default="Linear")
+    with controls[3]:
+        row_limit = st.number_input("Rows", min_value=100, max_value=50_000, value=5_000, step=100)
+
     try:
         rows = run_async(
-            fetch_latest_ohlcv(db_config, provider_slug=provider_slug, symbol=symbol or None, symbols=selected_symbols)
+            fetch_latest_ohlcv(
+                db_config,
+                provider_slug=provider_slug,
+                symbol=symbol or None,
+                symbols=selected_symbols,
+                timeframe=timeframe,
+                limit=int(row_limit),
+            )
         )
+        render_ohlcv_chart(rows, y_axis=str(y_axis or "Linear"))
         st.dataframe(rows, width="stretch", hide_index=True)
     except SQLAlchemyError as error:
         st.info(f"OHLCV unavailable: {error}")
+
+
+def render_ohlcv_chart(rows: list[dict[str, object]], *, y_axis: str) -> None:
+    if not rows:
+        st.info("No OHLCV rows found for the selected tickers and timeframe.")
+        return
+
+    chart_rows = [normalize_ohlcv_chart_row(row) for row in rows]
+    chart_rows.sort(key=lambda row: (row["bucket"], row["symbol"]))
+    if y_axis == "Log":
+        chart_rows = [row for row in chart_rows if row["close"] > 0]
+        if not chart_rows:
+            st.info("Log scale requires positive close prices.")
+            return
+
+    y_scale_type: Literal["linear", "log"] = "log" if y_axis == "Log" else "linear"
+    chart = (
+        alt.Chart(alt.Data(values=chart_rows))
+        .mark_line()
+        .encode(
+            x=alt.X("bucket:T", title="Time"),
+            y=alt.Y("close:Q", title="Close", scale=alt.Scale(type=y_scale_type, zero=False)),
+            color=alt.Color("symbol:N", title="Symbol"),
+            tooltip=[
+                alt.Tooltip("bucket:T", title="Time"),
+                alt.Tooltip("symbol:N", title="Symbol"),
+                alt.Tooltip("timeframe:N", title="Timeframe"),
+                alt.Tooltip("open:Q", title="Open", format=",.6f"),
+                alt.Tooltip("high:Q", title="High", format=",.6f"),
+                alt.Tooltip("low:Q", title="Low", format=",.6f"),
+                alt.Tooltip("close:Q", title="Close", format=",.6f"),
+                alt.Tooltip("volume:Q", title="Volume", format=",.4f"),
+                alt.Tooltip("trade_count:Q", title="Trades", format=","),
+            ],
+        )
+        .properties(height=420)
+        .interactive()
+    )
+    st.altair_chart(chart, width="stretch")
+
+
+def normalize_ohlcv_chart_row(row: dict[str, object]) -> OhlcvChartRow:
+    bucket = row["bucket"]
+    return {
+        "bucket": bucket.isoformat() if isinstance(bucket, datetime) else str(bucket),
+        "symbol": str(row["symbol"]),
+        "timeframe": str(row["timeframe"]),
+        "open": float(cast(str | int | float, row["open"])),
+        "high": float(cast(str | int | float, row["high"])),
+        "low": float(cast(str | int | float, row["low"])),
+        "close": float(cast(str | int | float, row["close"])),
+        "volume": float(cast(str | int | float, row["volume"])),
+        "trade_count": int(cast(str | int | float, row["trade_count"])),
+    }
 
 
 async def initialize_schema(db_config: DatabaseConfig, provider_slug: str) -> None:
@@ -477,11 +599,20 @@ async def fetch_latest_ohlcv(
     provider_slug: str,
     symbol: str | None,
     symbols: list[str],
+    timeframe: str,
+    limit: int,
 ) -> list[dict[str, object]]:
     engine = db_config.create_engine()
     try:
         await ensure_schema(engine, provider=provider_slug)
-        rows = await latest_ohlcv(engine, provider=provider_slug, symbol=symbol, symbols=symbols)
+        rows = await latest_ohlcv(
+            engine,
+            provider=provider_slug,
+            symbol=symbol,
+            symbols=symbols,
+            timeframe=timeframe,
+            limit=limit,
+        )
         return [row.model_dump() for row in rows]
     finally:
         await engine.dispose()
