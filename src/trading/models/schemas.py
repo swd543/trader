@@ -65,7 +65,6 @@ class AggregateResult(FrozenModel):
 class OhlcvRow(FrozenModel):
     bucket: datetime
     symbol: str
-    timeframe: str
     open: float
     high: float
     low: float

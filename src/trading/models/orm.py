@@ -38,7 +38,6 @@ class BybitOhlcvModel(Base):
 
     bucket: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     symbol: Mapped[str] = mapped_column(String, nullable=False)
-    timeframe: Mapped[str] = mapped_column(String, nullable=False)
     open: Mapped[float] = mapped_column(Float, nullable=False)
     high: Mapped[float] = mapped_column(Float, nullable=False)
     low: Mapped[float] = mapped_column(Float, nullable=False)
@@ -144,7 +143,7 @@ def ohlcv_model_for_symbol(provider: str, symbol: str) -> type[BybitOhlcvModel]:
             "__tablename__": table_name,
             "__module__": __name__,
             "__table_args__": (
-                PrimaryKeyConstraint("timeframe", "bucket"),
+                PrimaryKeyConstraint("bucket"),
                 Index(f"{table_name}_bucket_idx", "bucket"),
             ),
         },

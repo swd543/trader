@@ -39,6 +39,8 @@ TRADE_COLUMNS = (
     "foreign_notional",
     "source_file",
 )
+BASE_OHLCV_TIMEFRAME = "1 minute"
+BASE_OHLCV_INTERVAL_SQL = "INTERVAL '1 minute'"
 
 
 async def ensure_schema(
@@ -139,18 +141,16 @@ async def upsert_ohlcv_for_source(
     *,
     provider: str = "bybit",
     symbol: str | None = None,
-    timeframe: str = "1 minute",
 ) -> AggregateResult:
     normalized_provider = normalize_provider(provider)
     normalized_symbol = normalize_symbol(symbol) if symbol else symbol_from_source_file(source_file)
     trade_model = trade_model_for_symbol(normalized_provider, normalized_symbol)
     ohlcv_model = ohlcv_model_for_symbol(normalized_provider, normalized_symbol)
-    bucket = func.time_bucket(text("CAST(:timeframe AS text)::interval"), trade_model.ts)
+    bucket = func.time_bucket(text(BASE_OHLCV_INTERVAL_SQL), trade_model.ts)
     source_query = (
         select(
             bucket.label("bucket"),
             trade_model.symbol,
-            bindparam("timeframe").label("timeframe"),
             func.first(trade_model.price, trade_model.ts).label("open"),
             func.max(trade_model.price).label("high"),
             func.min(trade_model.price).label("low"),
@@ -167,7 +167,6 @@ async def upsert_ohlcv_for_source(
         [
             "bucket",
             "symbol",
-            "timeframe",
             "open",
             "high",
             "low",
@@ -180,7 +179,7 @@ async def upsert_ohlcv_for_source(
         source_query,
     )
     upsert_statement = insert_statement.on_conflict_do_update(
-        index_elements=[ohlcv_model.timeframe, ohlcv_model.bucket],
+        index_elements=[ohlcv_model.bucket],
         set_={
             "open": insert_statement.excluded.open,
             "high": insert_statement.excluded.high,
@@ -195,7 +194,7 @@ async def upsert_ohlcv_for_source(
 
     async with engine.begin() as conn:
         await _ensure_symbol_schema(conn, normalized_provider, normalized_symbol)
-        result = await conn.execute(upsert_statement, {"timeframe": timeframe, "source_file": source_file})
+        result = await conn.execute(upsert_statement, {"source_file": source_file})
     return AggregateResult(
         provider=normalized_provider,
         symbol=normalized_symbol,
@@ -211,7 +210,6 @@ async def source_file_status(
     symbol: str,
     source_file: str,
     trade_date: date,
-    timeframe: str,
 ) -> dict[str, bool]:
     normalized_provider = normalize_provider(provider)
     normalized_symbol = normalize_symbol(symbol)
@@ -234,7 +232,6 @@ async def source_file_status(
                 select(literal(True))
                 .select_from(ohlcv_model)
                 .where(
-                    ohlcv_model.timeframe == timeframe,
                     ohlcv_model.bucket >= day_start,
                     ohlcv_model.bucket < day_end,
                 )
@@ -309,6 +306,7 @@ async def latest_ohlcv(
         selected_symbols = [normalize_symbol(item) for item in symbols]
     else:
         selected_symbols = sorted(existing_symbols)
+    requested_timeframe = timeframe or BASE_OHLCV_TIMEFRAME
 
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     rows: list[OhlcvRow] = []
@@ -317,14 +315,37 @@ async def latest_ohlcv(
             if selected_symbol not in existing_symbols:
                 continue
             ohlcv_model = ohlcv_model_for_symbol(normalized_provider, selected_symbol)
-            statement = select(ohlcv_model)
-            if timeframe is not None:
-                statement = statement.where(ohlcv_model.timeframe == timeframe)
-            statement = statement.order_by(ohlcv_model.bucket.desc(), ohlcv_model.symbol).limit(limit)
-            symbol_rows = (await session.scalars(statement)).all()
-            rows.extend(OhlcvRow.model_validate(row) for row in symbol_rows)
+            if requested_timeframe == BASE_OHLCV_TIMEFRAME:
+                statement = (
+                    select(ohlcv_model)
+                    .order_by(ohlcv_model.bucket.desc(), ohlcv_model.symbol)
+                    .limit(limit)
+                )
+                symbol_rows = (await session.scalars(statement)).all()
+                rows.extend(OhlcvRow.model_validate(row) for row in symbol_rows)
+                continue
 
-    return sorted(rows, key=lambda row: (row.bucket, row.symbol), reverse=True)[:limit]
+            bucket = func.time_bucket(text("CAST(:timeframe AS text)::interval"), ohlcv_model.bucket)
+            statement = (
+                select(
+                    bucket.label("bucket"),
+                    ohlcv_model.symbol.label("symbol"),
+                    func.first(ohlcv_model.open, ohlcv_model.bucket).label("open"),
+                    func.max(ohlcv_model.high).label("high"),
+                    func.min(ohlcv_model.low).label("low"),
+                    func.last(ohlcv_model.close, ohlcv_model.bucket).label("close"),
+                    func.sum(ohlcv_model.volume).label("volume"),
+                    func.sum(ohlcv_model.quote_volume).label("quote_volume"),
+                    func.sum(ohlcv_model.trade_count).label("trade_count"),
+                )
+                .group_by(bucket, ohlcv_model.symbol)
+                .order_by(bucket.desc(), ohlcv_model.symbol)
+                .limit(limit)
+            )
+            result = await session.execute(statement, {"timeframe": requested_timeframe})
+            rows.extend(OhlcvRow.model_validate(row._mapping) for row in result.all())
+
+    return sorted(rows, key=lambda row: (row.bucket, row.symbol), reverse=True)
 
 
 async def list_ingested_symbols(engine: AsyncEngine, *, provider: str = "bybit") -> list[str]:
@@ -374,7 +395,7 @@ async def _ensure_symbol_schema(
             f"""
             ALTER TABLE {ohlcv_table} SET (
                 timescaledb.compress,
-                timescaledb.compress_segmentby = 'symbol,timeframe',
+                timescaledb.compress_segmentby = 'symbol',
                 timescaledb.compress_orderby = 'bucket DESC'
             )
             """
