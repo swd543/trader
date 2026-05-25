@@ -10,16 +10,16 @@ from typing import Any
 import streamlit as st
 from sqlalchemy.exc import SQLAlchemyError
 
-from trading.bybit import BybitPublicDataClient, TradeFile
 from trading.db import (
     compress_old_chunks,
     ensure_schema,
-    import_bybit_csv,
+    import_trade_csv,
     latest_ohlcv,
     table_counts,
     upsert_ohlcv_for_source,
 )
 from trading.models import DatabaseConfig
+from trading.providers import HistoricalTradeProvider, MarketDataFile, create_provider, provider_names
 
 TIMEFRAMES = ("1 minute", "5 minutes", "15 minutes", "1 hour", "1 day")
 
@@ -29,12 +29,13 @@ def main() -> None:
     st.title("Trading Data Loader")
 
     db_config = sidebar_database_config()
+    provider_slug = st.sidebar.selectbox("Provider", options=provider_names(), format_func=str.title)
     bybit_base_url = st.sidebar.text_input("Bybit base URL", value="https://public.bybit.com/trading/")
     timeout = st.sidebar.number_input("HTTP timeout", min_value=5, max_value=180, value=30, step=5)
 
-    client = BybitPublicDataClient(base_url=bybit_base_url, timeout=float(timeout))
+    client = create_provider(provider_slug, base_url=bybit_base_url, timeout=float(timeout))
 
-    show_database_status(db_config)
+    show_database_status(db_config, client.slug)
     st.divider()
 
     selected_symbols, start, end = ticker_explorer(client)
@@ -43,7 +44,7 @@ def main() -> None:
     download_panel(client, db_config, selected_symbols, start, end)
     st.divider()
 
-    ohlcv_panel(db_config, selected_symbols)
+    ohlcv_panel(db_config, client.slug, selected_symbols)
 
 
 def sidebar_database_config() -> DatabaseConfig:
@@ -58,47 +59,47 @@ def sidebar_database_config() -> DatabaseConfig:
     )
 
 
-def show_database_status(db_config: DatabaseConfig) -> None:
+def show_database_status(db_config: DatabaseConfig, provider_slug: str) -> None:
     left, middle, right = st.columns([1, 1, 2])
     with left:
         if st.button("Initialize Schema", width="stretch"):
-            run_schema_initialization(db_config)
+            run_schema_initialization(db_config, provider_slug)
     with middle:
         if st.button("Compress Old Chunks", width="stretch"):
-            run_compression(db_config)
+            run_compression(db_config, provider_slug)
     with right:
-        render_table_counts(db_config)
+        render_table_counts(db_config, provider_slug)
 
 
-def run_schema_initialization(db_config: DatabaseConfig) -> None:
+def run_schema_initialization(db_config: DatabaseConfig, provider_slug: str) -> None:
     try:
-        run_async(initialize_schema(db_config))
+        run_async(initialize_schema(db_config, provider_slug))
         st.success("Schema ready.")
     except SQLAlchemyError as error:
         st.error(f"Schema initialization failed: {error}")
 
 
-def run_compression(db_config: DatabaseConfig) -> None:
+def run_compression(db_config: DatabaseConfig, provider_slug: str) -> None:
     try:
-        compressed = run_async(compress_database(db_config))
+        compressed = run_async(compress_database(db_config, provider_slug))
         st.success(
             "Compressed chunks: "
-            f"bybit_trades={compressed['bybit_trades']}, bybit_ohlcv={compressed['bybit_ohlcv']}"
+            f"trades={compressed['trades']}, ohlcv={compressed['ohlcv']}"
         )
     except SQLAlchemyError as error:
         st.error(f"Compression failed: {error}")
 
 
-def render_table_counts(db_config: DatabaseConfig) -> None:
+def render_table_counts(db_config: DatabaseConfig, provider_slug: str) -> None:
     try:
-        counts = run_async(fetch_table_counts(db_config))
-        st.metric("Raw trades", f"{counts['bybit_trades']:,}")
-        st.metric("OHLCV rows", f"{counts['bybit_ohlcv']:,}")
+        counts = run_async(fetch_table_counts(db_config, provider_slug))
+        st.metric("Raw trades", f"{counts['trades']:,}")
+        st.metric("OHLCV rows", f"{counts['ohlcv']:,}")
     except SQLAlchemyError:
         st.info("Database not connected.")
 
 
-def ticker_explorer(client: BybitPublicDataClient) -> tuple[list[str], date, date]:
+def ticker_explorer(client: HistoricalTradeProvider) -> tuple[list[str], date, date]:
     st.subheader("Tickers")
     controls = st.columns([2, 1, 1])
     with controls[0]:
@@ -112,7 +113,7 @@ def ticker_explorer(client: BybitPublicDataClient) -> tuple[list[str], date, dat
         cached_symbols.clear()
 
     try:
-        symbols = cached_symbols(client.base_url, client.timeout)
+        symbols = cached_symbols(client.slug, getattr(client, "base_url", ""), getattr(client, "timeout", 30.0))
     except Exception as error:
         st.error(f"Could not fetch tickers: {error}")
         return [], start, end
@@ -126,11 +127,18 @@ def ticker_explorer(client: BybitPublicDataClient) -> tuple[list[str], date, dat
     return selected_symbols, start, end
 
 
-def preview_files(client: BybitPublicDataClient, selected_symbols: list[str], start: date, end: date) -> None:
+def preview_files(client: HistoricalTradeProvider, selected_symbols: list[str], start: date, end: date) -> None:
     rows: list[dict[str, Any]] = []
     for symbol in selected_symbols:
         try:
-            files = cached_trade_files(client.base_url, client.timeout, symbol, start.isoformat(), end.isoformat())
+            files = cached_trade_files(
+                client.slug,
+                getattr(client, "base_url", ""),
+                getattr(client, "timeout", 30.0),
+                symbol,
+                start.isoformat(),
+                end.isoformat(),
+            )
         except Exception as error:
             st.warning(f"{symbol}: {error}")
             continue
@@ -147,7 +155,7 @@ def preview_files(client: BybitPublicDataClient, selected_symbols: list[str], st
 
 
 def download_panel(
-    client: BybitPublicDataClient,
+    client: HistoricalTradeProvider,
     db_config: DatabaseConfig,
     selected_symbols: list[str],
     start: date,
@@ -156,7 +164,7 @@ def download_panel(
     st.subheader("Download And Ingest")
     options = st.columns([2, 1, 1, 1])
     with options[0]:
-        output_dir = Path(st.text_input("Output directory", value="data/bybit"))
+        output_dir = Path(st.text_input("Output directory", value=f"data/{client.slug}"))
     with options[1]:
         timeframe = st.selectbox("OHLCV timeframe", options=TIMEFRAMES)
     with options[2]:
@@ -180,7 +188,7 @@ def download_panel(
 
 
 def run_download_and_ingest(
-    client: BybitPublicDataClient,
+    client: HistoricalTradeProvider,
     db_config: DatabaseConfig,
     selected_symbols: list[str],
     start: date,
@@ -224,21 +232,21 @@ def run_download_and_ingest(
 
 
 def collect_trade_files(
-    client: BybitPublicDataClient,
+    client: HistoricalTradeProvider,
     selected_symbols: list[str],
     start: date,
     end: date,
-) -> list[TradeFile]:
-    files: list[TradeFile] = []
+) -> list[MarketDataFile]:
+    files: list[MarketDataFile] = []
     for symbol in selected_symbols:
         files.extend(client.list_trade_files(symbol, start_date=start, end_date=end))
     return files
 
 
 async def download_and_ingest_files(
-    client: BybitPublicDataClient,
+    client: HistoricalTradeProvider,
     db_config: DatabaseConfig,
-    files: list[TradeFile],
+    files: list[MarketDataFile],
     output_dir: Path,
     timeframe: str,
     *,
@@ -252,7 +260,7 @@ async def download_and_ingest_files(
 ) -> None:
     engine = db_config.create_engine()
     try:
-        await ensure_schema(engine)
+        await ensure_schema(engine, provider=client.slug)
         total_files = len(files)
         for index, trade_file in enumerate(files, start=1):
             overall_progress.progress((index - 1) / total_files, text=f"{index}/{total_files}: {trade_file.filename}")
@@ -277,8 +285,21 @@ async def download_and_ingest_files(
             def on_insert(rows_read: int) -> None:
                 ingest_slot.info(f"Inserting {trade_file.filename}: {rows_read:,} rows staged")
 
-            import_result = await import_bybit_csv(engine, path, progress_callback=on_insert)
-            aggregate_result = await upsert_ohlcv_for_source(engine, import_result.source_file, timeframe=timeframe)
+            import_result = await import_trade_csv(
+                engine,
+                path,
+                provider=client.slug,
+                symbol=trade_file.symbol,
+                row_iterator=client.iter_trade_rows,
+                progress_callback=on_insert,
+            )
+            aggregate_result = await upsert_ohlcv_for_source(
+                engine,
+                import_result.source_file,
+                provider=client.slug,
+                symbol=import_result.symbol,
+                timeframe=timeframe,
+            )
             ingest_slot.success(
                 f"Inserted {import_result.rows_inserted:,}/{import_result.rows_read:,} raw rows; "
                 f"upserted {aggregate_result.rows_upserted:,} OHLCV rows"
@@ -298,47 +319,49 @@ async def download_and_ingest_files(
             overall_progress.progress(index / total_files, text=f"{index}/{total_files}: complete")
 
         if compress_after:
-            compressed = await compress_old_chunks(engine, older_than="30 days")
+            compressed = await compress_old_chunks(engine, provider=client.slug, older_than="30 days")
             st.info(
                 "Compressed chunks: "
-                f"bybit_trades={compressed['bybit_trades']}, bybit_ohlcv={compressed['bybit_ohlcv']}"
+                f"trades={compressed['trades']}, ohlcv={compressed['ohlcv']}"
             )
     finally:
         await engine.dispose()
 
 
-def ohlcv_panel(db_config: DatabaseConfig, selected_symbols: list[str]) -> None:
+def ohlcv_panel(db_config: DatabaseConfig, provider_slug: str, selected_symbols: list[str]) -> None:
     st.subheader("OHLCV")
     symbol = st.selectbox("Symbol", options=["", *selected_symbols], format_func=lambda value: value or "All selected")
     try:
-        rows = run_async(fetch_latest_ohlcv(db_config, symbol=symbol or None, symbols=selected_symbols))
+        rows = run_async(
+            fetch_latest_ohlcv(db_config, provider_slug=provider_slug, symbol=symbol or None, symbols=selected_symbols)
+        )
         st.dataframe(rows, width="stretch", hide_index=True)
     except SQLAlchemyError as error:
         st.info(f"OHLCV unavailable: {error}")
 
 
-async def initialize_schema(db_config: DatabaseConfig) -> None:
+async def initialize_schema(db_config: DatabaseConfig, provider_slug: str) -> None:
     engine = db_config.create_engine()
     try:
-        await ensure_schema(engine)
+        await ensure_schema(engine, provider=provider_slug)
     finally:
         await engine.dispose()
 
 
-async def compress_database(db_config: DatabaseConfig) -> dict[str, int]:
+async def compress_database(db_config: DatabaseConfig, provider_slug: str) -> dict[str, int]:
     engine = db_config.create_engine()
     try:
-        await ensure_schema(engine)
-        return await compress_old_chunks(engine, older_than="30 days")
+        await ensure_schema(engine, provider=provider_slug)
+        return await compress_old_chunks(engine, provider=provider_slug, older_than="30 days")
     finally:
         await engine.dispose()
 
 
-async def fetch_table_counts(db_config: DatabaseConfig) -> dict[str, int]:
+async def fetch_table_counts(db_config: DatabaseConfig, provider_slug: str) -> dict[str, int]:
     engine = db_config.create_engine()
     try:
-        await ensure_schema(engine)
-        return await table_counts(engine)
+        await ensure_schema(engine, provider=provider_slug)
+        return await table_counts(engine, provider=provider_slug)
     finally:
         await engine.dispose()
 
@@ -346,13 +369,14 @@ async def fetch_table_counts(db_config: DatabaseConfig) -> dict[str, int]:
 async def fetch_latest_ohlcv(
     db_config: DatabaseConfig,
     *,
+    provider_slug: str,
     symbol: str | None,
     symbols: list[str],
 ) -> list[dict[str, object]]:
     engine = db_config.create_engine()
     try:
-        await ensure_schema(engine)
-        rows = await latest_ohlcv(engine, symbol=symbol, symbols=symbols)
+        await ensure_schema(engine, provider=provider_slug)
+        rows = await latest_ohlcv(engine, provider=provider_slug, symbol=symbol, symbols=symbols)
         return [row.model_dump() for row in rows]
     finally:
         await engine.dispose()
@@ -363,13 +387,20 @@ def run_async[T](coro: Coroutine[Any, Any, T]) -> T:
 
 
 @st.cache_data(ttl=3600)
-def cached_symbols(base_url: str, timeout: float) -> list[str]:
-    return BybitPublicDataClient(base_url=base_url, timeout=timeout).list_symbols()
+def cached_symbols(provider_slug: str, base_url: str, timeout: float) -> list[str]:
+    return create_provider(provider_slug, base_url=base_url, timeout=timeout).list_symbols()
 
 
 @st.cache_data(ttl=300)
-def cached_trade_files(base_url: str, timeout: float, symbol: str, start: str, end: str) -> list[TradeFile]:
-    return BybitPublicDataClient(base_url=base_url, timeout=timeout).list_trade_files(
+def cached_trade_files(
+    provider_slug: str,
+    base_url: str,
+    timeout: float,
+    symbol: str,
+    start: str,
+    end: str,
+) -> list[MarketDataFile]:
+    return create_provider(provider_slug, base_url=base_url, timeout=timeout).list_trade_files(
         symbol,
         start_date=start,
         end_date=end,

@@ -44,6 +44,7 @@ class DatabaseConfig(FrozenModel):
 
 
 class ImportResult(FrozenModel):
+    provider: str
     symbol: str
     trades_table: str
     ohlcv_table: str
@@ -55,6 +56,7 @@ class ImportResult(FrozenModel):
 
 
 class AggregateResult(FrozenModel):
+    provider: str
     symbol: str
     ohlcv_table: str
     rows_upserted: int

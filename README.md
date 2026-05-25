@@ -27,3 +27,5 @@ Start the Streamlit app:
 ```sh
 uv run trading-app
 ```
+
+Provider implementations live under `trading.providers`. A provider supplies ticker discovery, dated trade-file discovery, downloading, and a parser that converts source files into the common trade-row shape used by the database importer.
