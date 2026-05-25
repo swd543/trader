@@ -1,5 +1,7 @@
 # trading
 
+[![CI](https://github.com/swd543/trading/actions/workflows/ci.yml/badge.svg)](https://github.com/swd543/trading/actions/workflows/ci.yml)
+
 Small trading-data utilities for downloading historical trades, ingesting them
 into TimescaleDB, and exploring rolled-up OHLCV charts.
 
