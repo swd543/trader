@@ -40,6 +40,7 @@ TRADE_COLUMNS = (
     "foreign_notional",
     "source_file",
 )
+TRADE_STAGE_TABLE = "market_data_trades_stage"
 BASE_OHLCV_TIMEFRAME = "1 minute"
 BASE_OHLCV_INTERVAL_SQL = "INTERVAL '1 minute'"
 
@@ -78,52 +79,11 @@ async def import_trade_csv(
     async with engine.begin() as conn:
         if ensure_symbol_schema:
             await _ensure_symbol_schema(conn, normalized_provider, normalized_symbol)
-        await conn.execute(
-            text(
-                f"""
-                CREATE TEMP TABLE market_data_trades_stage (
-                    LIKE {trades_table} INCLUDING DEFAULTS
-                ) ON COMMIT DROP
-                """
-            )
-        )
+        await _create_trade_stage_table(conn, trades_table)
         rows_read = await _copy_trade_rows(conn, path, source_file, row_iterator, progress_callback)
-        result = await conn.execute(
-            text(
-                f"""
-                INSERT INTO {trades_table} (
-                    ts,
-                    symbol,
-                    side,
-                    size,
-                    price,
-                    tick_direction,
-                    trade_id,
-                    gross_value,
-                    home_notional,
-                    foreign_notional,
-                    source_file
-                )
-                SELECT
-                    ts,
-                    symbol,
-                    side,
-                    size,
-                    price,
-                    tick_direction,
-                    trade_id,
-                    gross_value,
-                    home_notional,
-                    foreign_notional,
-                    source_file
-                FROM market_data_trades_stage
-                ON CONFLICT DO NOTHING
-                """
-            )
-        )
+        result = await _insert_trades_from_stage(conn, trades_table)
         rows_inserted = result.rowcount if result.rowcount is not None else 0
-        bounds = await conn.execute(text("SELECT min(ts), max(ts) FROM market_data_trades_stage"))
-        min_ts, max_ts = bounds.one_or_none() or (None, None)
+        min_ts, max_ts = await _stage_time_bounds(conn)
 
     return ImportResult(
         provider=normalized_provider,
@@ -138,12 +98,68 @@ async def import_trade_csv(
     )
 
 
+async def import_trade_csv_and_upsert_ohlcv(
+    engine: AsyncEngine,
+    path: Path,
+    *,
+    provider: str,
+    symbol: str | None = None,
+    row_iterator: Callable[[Path, str], Iterator[TradeRow]],
+    progress_callback: Callable[[int], None] | None = None,
+    phase_callback: Callable[[str], None] | None = None,
+    ensure_symbol_schema: bool = True,
+) -> tuple[ImportResult, AggregateResult]:
+    normalized_provider = normalize_provider(provider)
+    source_file = path.name
+    normalized_symbol = normalize_symbol(symbol) if symbol else symbol_from_source_file(source_file)
+    trade_model = trade_model_for_symbol(normalized_provider, normalized_symbol)
+    ohlcv_model = ohlcv_model_for_symbol(normalized_provider, normalized_symbol)
+    trades_table = trade_model.__tablename__
+    ohlcv_table = ohlcv_model.__tablename__
+
+    async with engine.begin() as conn:
+        if ensure_symbol_schema:
+            await _ensure_symbol_schema(conn, normalized_provider, normalized_symbol)
+        await _create_trade_stage_table(conn, trades_table)
+        rows_read = await _copy_trade_rows(conn, path, source_file, row_iterator, progress_callback)
+        if phase_callback is not None:
+            phase_callback("upserting raw trades")
+        result = await _insert_trades_from_stage(conn, trades_table)
+        rows_inserted = result.rowcount if result.rowcount is not None else 0
+        min_ts, max_ts = await _stage_time_bounds(conn)
+        if phase_callback is not None:
+            phase_callback(f"aggregating {BASE_OHLCV_TIMEFRAME} OHLCV")
+        aggregate_result = await _upsert_ohlcv_from_stage(conn, ohlcv_table)
+
+    import_result = ImportResult(
+        provider=normalized_provider,
+        symbol=normalized_symbol,
+        trades_table=trade_model.__tablename__,
+        ohlcv_table=ohlcv_table,
+        source_file=source_file,
+        rows_read=rows_read,
+        rows_inserted=rows_inserted,
+        min_ts=min_ts,
+        max_ts=max_ts,
+    )
+    return (
+        import_result,
+        AggregateResult(
+            provider=normalized_provider,
+            symbol=normalized_symbol,
+            ohlcv_table=ohlcv_table,
+            rows_upserted=aggregate_result.rowcount if aggregate_result.rowcount is not None else 0,
+        ),
+    )
+
+
 async def upsert_ohlcv_for_source(
     engine: AsyncEngine,
     source_file: str,
     *,
     provider: str = "bybit",
     symbol: str | None = None,
+    trade_date: date | None = None,
     ensure_symbol_schema: bool = True,
 ) -> AggregateResult:
     normalized_provider = normalize_provider(provider)
@@ -151,6 +167,19 @@ async def upsert_ohlcv_for_source(
     trade_model = trade_model_for_symbol(normalized_provider, normalized_symbol)
     ohlcv_model = ohlcv_model_for_symbol(normalized_provider, normalized_symbol)
     bucket = func.time_bucket(text(BASE_OHLCV_INTERVAL_SQL), trade_model.ts)
+    source_filters = [trade_model.source_file == bindparam("source_file")]
+    params: dict[str, object] = {"source_file": source_file}
+    if trade_date is not None:
+        day_start, day_end = _day_bounds(trade_date)
+        source_filters.extend(
+            [
+                trade_model.ts >= bindparam("day_start"),
+                trade_model.ts < bindparam("day_end"),
+            ]
+        )
+        params["day_start"] = day_start
+        params["day_end"] = day_end
+
     source_query = (
         select(
             bucket.label("bucket"),
@@ -164,7 +193,7 @@ async def upsert_ohlcv_for_source(
             func.count().label("trade_count"),
             func.now().label("updated_at"),
         )
-        .where(trade_model.source_file == bindparam("source_file"))
+        .where(*source_filters)
         .group_by(bucket, trade_model.symbol)
     )
     insert_statement = pg_insert(cast(Table, ohlcv_model.__table__)).from_select(
@@ -199,7 +228,7 @@ async def upsert_ohlcv_for_source(
     async with engine.begin() as conn:
         if ensure_symbol_schema:
             await _ensure_symbol_schema(conn, normalized_provider, normalized_symbol)
-        result = await conn.execute(upsert_statement, {"source_file": source_file})
+        result = await conn.execute(upsert_statement, params)
     return AggregateResult(
         provider=normalized_provider,
         symbol=normalized_symbol,
@@ -220,15 +249,18 @@ async def source_file_status(
     normalized_symbol = normalize_symbol(symbol)
     trade_model = trade_model_for_symbol(normalized_provider, normalized_symbol)
     ohlcv_model = ohlcv_model_for_symbol(normalized_provider, normalized_symbol)
-    day_start = datetime.combine(trade_date, time.min, tzinfo=UTC)
-    day_end = day_start + timedelta(days=1)
+    day_start, day_end = _day_bounds(trade_date)
 
     async with engine.connect() as conn:
         has_trades = bool(
             await conn.scalar(
                 select(literal(True))
                 .select_from(trade_model)
-                .where(trade_model.source_file == source_file)
+                .where(
+                    trade_model.source_file == source_file,
+                    trade_model.ts >= day_start,
+                    trade_model.ts < day_end,
+                )
                 .limit(1)
             )
         )
@@ -405,6 +437,11 @@ def _select_symbols(
     return sorted(existing_symbols)
 
 
+def _day_bounds(value: date) -> tuple[datetime, datetime]:
+    day_start = datetime.combine(value, time.min, tzinfo=UTC)
+    return day_start, day_start + timedelta(days=1)
+
+
 async def _ensure_symbol_schema(
     conn: AsyncConnection,
     provider: str,
@@ -535,12 +572,109 @@ async def _copy_trade_rows(
 
     raw_connection = await conn.get_raw_connection()
     driver_connection: Any = raw_connection.driver_connection
-    await driver_connection.copy_records_to_table("market_data_trades_stage", records=rows(), columns=TRADE_COLUMNS)
+    await driver_connection.copy_records_to_table(TRADE_STAGE_TABLE, records=rows(), columns=TRADE_COLUMNS)
 
     if progress_callback is not None:
         progress_callback(rows_read)
 
     return rows_read
+
+
+async def _create_trade_stage_table(conn: AsyncConnection, trades_table: str) -> None:
+    await conn.execute(
+        text(
+            f"""
+            CREATE TEMP TABLE {TRADE_STAGE_TABLE} (
+                LIKE {trades_table} INCLUDING DEFAULTS
+            ) ON COMMIT DROP
+            """
+        )
+    )
+
+
+async def _insert_trades_from_stage(conn: AsyncConnection, trades_table: str) -> Any:
+    return await conn.execute(
+        text(
+            f"""
+            INSERT INTO {trades_table} (
+                ts,
+                symbol,
+                side,
+                size,
+                price,
+                tick_direction,
+                trade_id,
+                gross_value,
+                home_notional,
+                foreign_notional,
+                source_file
+            )
+            SELECT
+                ts,
+                symbol,
+                side,
+                size,
+                price,
+                tick_direction,
+                trade_id,
+                gross_value,
+                home_notional,
+                foreign_notional,
+                source_file
+            FROM {TRADE_STAGE_TABLE}
+            ON CONFLICT DO NOTHING
+            """
+        )
+    )
+
+
+async def _stage_time_bounds(conn: AsyncConnection) -> tuple[datetime | None, datetime | None]:
+    bounds = await conn.execute(text(f"SELECT min(ts), max(ts) FROM {TRADE_STAGE_TABLE}"))
+    min_ts, max_ts = bounds.one_or_none() or (None, None)
+    return min_ts, max_ts
+
+
+async def _upsert_ohlcv_from_stage(conn: AsyncConnection, ohlcv_table: str) -> Any:
+    return await conn.execute(
+        text(
+            f"""
+            INSERT INTO {ohlcv_table} (
+                bucket,
+                symbol,
+                open,
+                high,
+                low,
+                close,
+                volume,
+                quote_volume,
+                trade_count,
+                updated_at
+            )
+            SELECT
+                time_bucket({BASE_OHLCV_INTERVAL_SQL}, ts) AS bucket,
+                symbol,
+                first(price, ts) AS open,
+                max(price) AS high,
+                min(price) AS low,
+                last(price, ts) AS close,
+                sum(size) AS volume,
+                sum(foreign_notional) AS quote_volume,
+                count(*) AS trade_count,
+                now() AS updated_at
+            FROM {TRADE_STAGE_TABLE}
+            GROUP BY bucket, symbol
+            ON CONFLICT (bucket) DO UPDATE SET
+                open = EXCLUDED.open,
+                high = EXCLUDED.high,
+                low = EXCLUDED.low,
+                close = EXCLUDED.close,
+                volume = EXCLUDED.volume,
+                quote_volume = EXCLUDED.quote_volume,
+                trade_count = EXCLUDED.trade_count,
+                updated_at = now()
+            """
+        )
+    )
 
 
 async def _add_compression_policy(conn: AsyncConnection, table_name: str, compression_after: str) -> None:
