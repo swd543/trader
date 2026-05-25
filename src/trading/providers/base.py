@@ -8,7 +8,6 @@ from typing import Protocol
 
 type DownloadProgress = Callable[[int, int | None], None]
 type CancelCheck = Callable[[], bool]
-type InsertProgress = Callable[[int], None]
 type TradeRow = tuple[datetime, str, str, float, float, str, str, float | None, float | None, float | None, str]
 
 
@@ -39,9 +38,9 @@ class HistoricalTradeProvider(Protocol):
     slug: str
     display_name: str
 
-    def list_symbols(self) -> list[str]: ...
+    async def list_symbols(self) -> list[str]: ...
 
-    def list_trade_files(
+    async def list_trade_files(
         self,
         symbol: str,
         *,
@@ -49,7 +48,7 @@ class HistoricalTradeProvider(Protocol):
         end_date: str | date | None = None,
     ) -> list[MarketDataFile]: ...
 
-    def download_trade_file(
+    async def download_trade_file(
         self,
         trade_file: MarketDataFile,
         output_dir: str | Path,

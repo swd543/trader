@@ -1,4 +1,4 @@
-from trading.bybit import BybitPublicDataClient, TradeFile
 from trading.cli import main
+from trading.providers.bybit import BybitPublicDataClient
 
-__all__ = ["BybitPublicDataClient", "TradeFile", "main"]
+__all__ = ["BybitPublicDataClient", "main"]

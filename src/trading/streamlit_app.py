@@ -45,6 +45,7 @@ class DownloadJob:
     ingest_text: str = ""
     error: str | None = None
     log_rows: list[dict[str, Any]] = field(default_factory=list)
+    file_rows: dict[str, dict[str, Any]] = field(default_factory=dict)
     cancel_event: threading.Event = field(default_factory=threading.Event)
     lock: threading.Lock = field(default_factory=threading.Lock)
     thread: threading.Thread | None = None
@@ -69,6 +70,14 @@ def main() -> None:
     db_config = sidebar_database_config()
     provider_slug, provider_options = sidebar_provider_config()
     client = create_provider(provider_slug, **provider_options)
+
+    active_job = current_download_job()
+    if active_job is not None:
+        st.subheader("Download And Ingest")
+        render_download_job_status()
+        st.divider()
+        if download_job_is_running(active_job):
+            return
 
     show_database_status(db_config, client.slug)
     st.divider()
@@ -244,8 +253,6 @@ def download_panel(
             cleanup_files=cleanup_files,
         )
 
-    render_download_job_status()
-
 
 def start_download_job(
     client: HistoricalTradeProvider,
@@ -307,7 +314,7 @@ def run_download_job_worker(
     try:
         update_download_job(job, message="Collecting files", overall_text="Collecting files")
         raise_if_job_cancelled(job)
-        files = collect_trade_files(client, selected_symbols, start, end)
+        files = run_async(collect_trade_files(client, selected_symbols, start, end))
         raise_if_job_cancelled(job)
         if not files:
             update_download_job(
@@ -318,6 +325,8 @@ def run_download_job_worker(
                 overall_text="No files found",
             )
             return
+        initialize_download_file_rows(job, files)
+        update_download_job(job, message=f"Found {len(files):,} files", overall_text=f"Found {len(files):,} files")
 
         run_async(
             download_and_ingest_files(
@@ -341,6 +350,7 @@ def run_download_job_worker(
             overall_text="Complete",
         )
     except DownloadCancelled:
+        mark_unfinished_download_files(job, "cancelled")
         update_download_job(
             job,
             status="cancelled",
@@ -350,12 +360,26 @@ def run_download_job_worker(
         )
     except Exception as error:
         logger.exception("Download and ingest job failed")
+        mark_unfinished_download_files(job, "failed")
         update_download_job(job, status="failed", message=f"Job failed: {error}", error=str(error))
 
 
 def current_download_job() -> DownloadJob | None:
     job = st.session_state.get(DOWNLOAD_JOB_KEY)
-    return job if isinstance(job, DownloadJob) else None
+    if job is None:
+        return None
+
+    required_attributes = (
+        "status",
+        "thread",
+        "lock",
+        "cancel_event",
+        "log_rows",
+        "file_rows",
+    )
+    if all(hasattr(job, attribute) for attribute in required_attributes):
+        return cast(DownloadJob, job)
+    return None
 
 
 def download_job_is_running(job: DownloadJob) -> bool:
@@ -373,6 +397,57 @@ def append_download_job_log(job: DownloadJob, row: dict[str, Any]) -> None:
         job.log_rows.append(row)
 
 
+def initialize_download_file_rows(job: DownloadJob, files: list[MarketDataFile]) -> None:
+    with job.lock:
+        job.file_rows = {
+            trade_file.filename: download_file_row(trade_file, index=index, status="queued")
+            for index, trade_file in enumerate(files, start=1)
+        }
+
+
+def update_download_file_row(
+    job: DownloadJob,
+    trade_file: MarketDataFile,
+    *,
+    status: str,
+    downloaded_bytes: int | None = None,
+    total_bytes: int | None = None,
+    download_percent: float | None = None,
+) -> None:
+    with job.lock:
+        row = job.file_rows.setdefault(trade_file.filename, download_file_row(trade_file, index=len(job.file_rows) + 1, status=status))
+        row["status"] = status
+        if downloaded_bytes is not None:
+            row["downloaded_bytes"] = downloaded_bytes
+        if total_bytes is not None:
+            row["total_bytes"] = total_bytes
+        if download_percent is not None:
+            row["download_percent"] = download_percent
+        elif total_bytes:
+            row["download_percent"] = round((downloaded_bytes or 0) / total_bytes * 100, 1)
+
+
+def mark_unfinished_download_files(job: DownloadJob, status: str) -> None:
+    finished = {"completed", "failed", "cancelled"}
+    with job.lock:
+        for row in job.file_rows.values():
+            if row["status"] not in finished:
+                row["status"] = status
+
+
+def download_file_row(trade_file: MarketDataFile, *, index: int, status: str) -> dict[str, Any]:
+    return {
+        "order": index,
+        "symbol": trade_file.symbol,
+        "date": trade_file.trade_date,
+        "file": trade_file.filename,
+        "status": status,
+        "download_percent": 0.0,
+        "downloaded_bytes": 0,
+        "total_bytes": None,
+    }
+
+
 def download_job_snapshot(job: DownloadJob) -> dict[str, Any]:
     with job.lock:
         return {
@@ -386,10 +461,11 @@ def download_job_snapshot(job: DownloadJob) -> dict[str, Any]:
             "ingest_text": job.ingest_text,
             "error": job.error,
             "log_rows": list(job.log_rows),
+            "file_rows": sorted((dict(row) for row in job.file_rows.values()), key=lambda row: int(row["order"])),
         }
 
 
-@st.fragment(run_every="1s")
+@st.fragment(run_every=0.5)
 def render_download_job_status() -> None:
     job = current_download_job()
     if job is None:
@@ -425,9 +501,47 @@ def render_download_job_status() -> None:
     if snapshot["ingest_text"]:
         st.info(str(snapshot["ingest_text"]))
 
+    file_rows = cast(list[dict[str, Any]], snapshot["file_rows"])
+    if file_rows:
+        active_file_rows = [row for row in file_rows if row["status"] != "completed"]
+        completed_file_rows = [row for row in file_rows if row["status"] == "completed"]
+        if active_file_rows:
+            st.caption("Active Files")
+            render_download_file_rows(active_file_rows)
+        if completed_file_rows:
+            st.caption("Completed Files")
+            render_download_file_rows(completed_file_rows)
+
     log_rows = cast(list[dict[str, Any]], snapshot["log_rows"])
     if log_rows:
         st.dataframe(log_rows, width="stretch", hide_index=True)
+
+
+def render_download_file_rows(rows: list[dict[str, Any]]) -> None:
+    st.dataframe(
+        rows,
+        width="stretch",
+        hide_index=True,
+        column_order=(
+            "symbol",
+            "date",
+            "file",
+            "status",
+            "download_percent",
+            "downloaded_bytes",
+            "total_bytes",
+        ),
+        column_config={
+            "download_percent": st.column_config.ProgressColumn(
+                "Download",
+                format="%.1f%%",
+                min_value=0.0,
+                max_value=100.0,
+            ),
+            "downloaded_bytes": st.column_config.NumberColumn("Downloaded bytes", format="%d"),
+            "total_bytes": st.column_config.NumberColumn("Total bytes", format="%d"),
+        },
+    )
 
 
 def raise_if_job_cancelled(job: DownloadJob) -> None:
@@ -435,7 +549,7 @@ def raise_if_job_cancelled(job: DownloadJob) -> None:
         raise DownloadCancelled("Download job cancelled")
 
 
-def collect_trade_files(
+async def collect_trade_files(
     client: HistoricalTradeProvider,
     selected_symbols: list[str],
     start: date,
@@ -443,7 +557,7 @@ def collect_trade_files(
 ) -> list[MarketDataFile]:
     files: list[MarketDataFile] = []
     for symbol in selected_symbols:
-        files.extend(client.list_trade_files(symbol, start_date=start, end_date=end))
+        files.extend(await client.list_trade_files(symbol, start_date=start, end_date=end))
     return files
 
 
@@ -465,111 +579,17 @@ async def download_and_ingest_files(
         raise_if_job_cancelled(job)
         await ensure_schema(engine, provider=client.slug, symbols=sorted({file.symbol for file in files}))
         raise_if_job_cancelled(job)
-        total_files = len(files)
-        if max_concurrent > 1:
-            await download_and_ingest_concurrently(
-                client,
-                engine,
-                files,
-                output_dir,
-                timeframe,
-                max_concurrent=max_concurrent,
-                overwrite=overwrite,
-                cleanup_files=cleanup_files,
-                job=job,
-            )
-            raise_if_job_cancelled(job)
-            if compress_after:
-                update_download_job(job, message="Compressing old chunks", ingest_text="Compressing old chunks")
-                compressed = await compress_old_chunks(engine, provider=client.slug, older_than="30 days")
-                update_download_job(
-                    job,
-                    ingest_text=(
-                        "Compressed chunks: "
-                        f"trades={compressed['trades']}, ohlcv={compressed['ohlcv']}"
-                    ),
-                )
-            return
-
-        for index, trade_file in enumerate(files, start=1):
-            raise_if_job_cancelled(job)
-            update_download_job(
-                job,
-                message=f"Processing {trade_file.filename}",
-                overall_fraction=(index - 1) / total_files,
-                overall_text=f"{index}/{total_files}: {trade_file.filename}",
-                download_fraction=0.0,
-                download_text=f"Waiting to download {trade_file.filename}",
-            )
-
-            def on_download(downloaded_bytes: int, total_bytes: int | None) -> None:
-                raise_if_job_cancelled(job)
-                if total_bytes:
-                    update_download_job(
-                        job,
-                        download_fraction=min(downloaded_bytes / total_bytes, 1.0),
-                        download_text=f"Downloading {trade_file.filename}: {downloaded_bytes / total_bytes:.0%}",
-                    )
-                else:
-                    update_download_job(
-                        job,
-                        download_fraction=0.0,
-                        download_text=f"Downloading {trade_file.filename}: {downloaded_bytes:,} bytes",
-                    )
-
-            path = await asyncio.to_thread(
-                client.download_trade_file,
-                trade_file,
-                output_dir,
-                overwrite=overwrite,
-                progress_callback=on_download,
-                cancel_callback=job.cancel_event.is_set,
-            )
-            update_download_job(job, download_fraction=1.0, download_text=f"Downloaded {trade_file.filename}")
-            raise_if_job_cancelled(job)
-
-            def on_insert(rows_read: int) -> None:
-                raise_if_job_cancelled(job)
-                update_download_job(job, ingest_text=f"Inserting {trade_file.filename}: {rows_read:,} rows staged")
-
-            import_result = await import_trade_csv(
-                engine,
-                path,
-                provider=client.slug,
-                symbol=trade_file.symbol,
-                row_iterator=client.iter_trade_rows,
-                progress_callback=on_insert,
-            )
-            aggregate_result = await upsert_ohlcv_for_source(
-                engine,
-                import_result.source_file,
-                provider=client.slug,
-                symbol=import_result.symbol,
-                timeframe=timeframe,
-            )
-            update_download_job(
-                job,
-                ingest_text=(
-                    f"Inserted {import_result.rows_inserted:,}/{import_result.rows_read:,} raw rows; "
-                    f"upserted {aggregate_result.rows_upserted:,} OHLCV rows"
-                ),
-            )
-            local_file_deleted = cleanup_downloaded_file(path, output_dir) if cleanup_files else False
-
-            append_download_job_log(
-                job,
-                {
-                    "file": trade_file.filename,
-                    "raw_rows": import_result.rows_read,
-                    "inserted_rows": import_result.rows_inserted,
-                    "ohlcv_rows": aggregate_result.rows_upserted,
-                    "min_ts": import_result.min_ts,
-                    "max_ts": import_result.max_ts,
-                    "local_file_deleted": local_file_deleted,
-                },
-            )
-            update_download_job(job, overall_fraction=index / total_files, overall_text=f"{index}/{total_files}: complete")
-
+        await download_and_ingest_concurrently(
+            client,
+            engine,
+            files,
+            output_dir,
+            timeframe,
+            max_concurrent=max_concurrent,
+            overwrite=overwrite,
+            cleanup_files=cleanup_files,
+            job=job,
+        )
         raise_if_job_cancelled(job)
         if compress_after:
             update_download_job(job, message="Compressing old chunks", ingest_text="Compressing old chunks")
@@ -611,40 +631,63 @@ async def download_and_ingest_concurrently(
 
     async def process_file(trade_file: MarketDataFile) -> dict[str, Any]:
         async with semaphore:
-            raise_if_job_cancelled(job)
-            path = await asyncio.to_thread(
-                client.download_trade_file,
-                trade_file,
-                output_dir,
-                overwrite=overwrite,
-                cancel_callback=job.cancel_event.is_set,
-            )
-            raise_if_job_cancelled(job)
-            import_result = await import_trade_csv(
-                engine,
-                path,
-                provider=client.slug,
-                symbol=trade_file.symbol,
-                row_iterator=client.iter_trade_rows,
-            )
-            raise_if_job_cancelled(job)
-            aggregate_result = await upsert_ohlcv_for_source(
-                engine,
-                import_result.source_file,
-                provider=client.slug,
-                symbol=import_result.symbol,
-                timeframe=timeframe,
-            )
-            local_file_deleted = cleanup_downloaded_file(path, output_dir) if cleanup_files else False
-            return {
-                "file": trade_file.filename,
-                "raw_rows": import_result.rows_read,
-                "inserted_rows": import_result.rows_inserted,
-                "ohlcv_rows": aggregate_result.rows_upserted,
-                "min_ts": import_result.min_ts,
-                "max_ts": import_result.max_ts,
-                "local_file_deleted": local_file_deleted,
-            }
+            try:
+                raise_if_job_cancelled(job)
+                update_download_file_row(job, trade_file, status="downloading")
+
+                def on_download(downloaded_bytes: int, total_bytes: int | None) -> None:
+                    raise_if_job_cancelled(job)
+                    update_download_file_row(
+                        job,
+                        trade_file,
+                        status="downloading",
+                        downloaded_bytes=downloaded_bytes,
+                        total_bytes=total_bytes,
+                    )
+
+                path = await client.download_trade_file(
+                    trade_file,
+                    output_dir,
+                    overwrite=overwrite,
+                    progress_callback=on_download,
+                    cancel_callback=job.cancel_event.is_set,
+                )
+                update_download_file_row(job, trade_file, status="downloaded", download_percent=100.0)
+                raise_if_job_cancelled(job)
+                update_download_file_row(job, trade_file, status="ingesting")
+                import_result = await import_trade_csv(
+                    engine,
+                    path,
+                    provider=client.slug,
+                    symbol=trade_file.symbol,
+                    row_iterator=client.iter_trade_rows,
+                )
+                raise_if_job_cancelled(job)
+                update_download_file_row(job, trade_file, status="aggregating")
+                aggregate_result = await upsert_ohlcv_for_source(
+                    engine,
+                    import_result.source_file,
+                    provider=client.slug,
+                    symbol=import_result.symbol,
+                    timeframe=timeframe,
+                )
+                local_file_deleted = cleanup_downloaded_file(path, output_dir) if cleanup_files else False
+                update_download_file_row(job, trade_file, status="completed", download_percent=100.0)
+                return {
+                    "file": trade_file.filename,
+                    "raw_rows": import_result.rows_read,
+                    "inserted_rows": import_result.rows_inserted,
+                    "ohlcv_rows": aggregate_result.rows_upserted,
+                    "min_ts": import_result.min_ts,
+                    "max_ts": import_result.max_ts,
+                    "local_file_deleted": local_file_deleted,
+                }
+            except DownloadCancelled:
+                update_download_file_row(job, trade_file, status="cancelled")
+                raise
+            except Exception:
+                update_download_file_row(job, trade_file, status="failed")
+                raise
 
     tasks = [asyncio.create_task(process_file(trade_file)) for trade_file in files]
     try:
@@ -860,7 +903,7 @@ def default_symbols(symbols: list[str]) -> list[str]:
 
 @st.cache_data(ttl=3600)
 def cached_symbols(provider_slug: str, options: tuple[tuple[str, object], ...]) -> list[str]:
-    return create_provider(provider_slug, **provider_kwargs(options)).list_symbols()
+    return run_async(create_provider(provider_slug, **provider_kwargs(options)).list_symbols())
 
 
 @st.cache_data(ttl=300)
@@ -871,10 +914,12 @@ def cached_trade_files(
     start: str,
     end: str,
 ) -> list[MarketDataFile]:
-    return create_provider(provider_slug, **provider_kwargs(options)).list_trade_files(
-        symbol,
-        start_date=start,
-        end_date=end,
+    return run_async(
+        create_provider(provider_slug, **provider_kwargs(options)).list_trade_files(
+            symbol,
+            start_date=start,
+            end_date=end,
+        )
     )
 
 

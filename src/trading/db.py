@@ -132,24 +132,6 @@ async def import_trade_csv(
     )
 
 
-async def import_bybit_csv(
-    engine: AsyncEngine,
-    path: Path,
-    *,
-    progress_callback: Callable[[int], None] | None = None,
-) -> ImportResult:
-    from trading.providers.bybit import iter_trade_rows
-
-    return await import_trade_csv(
-        engine,
-        path,
-        provider="bybit",
-        symbol=symbol_from_source_file(path.name),
-        row_iterator=iter_trade_rows,
-        progress_callback=progress_callback,
-    )
-
-
 async def upsert_ohlcv_for_source(
     engine: AsyncEngine,
     source_file: str,

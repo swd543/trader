@@ -1,17 +1,19 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import logging
 from pathlib import Path
 
-from trading.bybit import BybitPublicDataClient
+from trading.providers import MarketDataFile
+from trading.providers.bybit import BybitPublicDataClient
 
 
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
     configure_logging(args.verbose)
-    args.func(args)
+    asyncio.run(args.func(args))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -41,7 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
     download_parser.add_argument("--no-extract", action="store_true", help="Keep files as .csv.gz archives.")
     download_parser.add_argument("--keep-archive", action="store_true", help="Keep .csv.gz files after extracting.")
     download_parser.add_argument("--overwrite", action="store_true", help="Replace existing local files.")
-    download_parser.add_argument("--sleep", type=float, default=0, help="Seconds to sleep between downloads.")
+    download_parser.add_argument("--max-concurrent", type=int, default=4, help="Maximum concurrent file downloads.")
     download_parser.set_defaults(func=run_download)
 
     return parser
@@ -57,33 +59,40 @@ def add_date_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--end-date", help="End date, inclusive, as YYYY-MM-DD.")
 
 
-def run_symbols(args: argparse.Namespace) -> None:
+async def run_symbols(args: argparse.Namespace) -> None:
     client = make_client(args)
-    symbols = client.list_symbols()
+    symbols = await client.list_symbols()
     for symbol in _limited(symbols, args.limit):
         print(symbol)
 
 
-def run_files(args: argparse.Namespace) -> None:
+async def run_files(args: argparse.Namespace) -> None:
     client = make_client(args)
-    files = client.list_trade_files(args.symbol, start_date=args.start_date, end_date=args.end_date)
+    files = await client.list_trade_files(args.symbol, start_date=args.start_date, end_date=args.end_date)
     for trade_file in _limited(files, args.limit):
         print(f"{trade_file.trade_date} {trade_file.filename} {trade_file.url}")
 
 
-def run_download(args: argparse.Namespace) -> None:
+async def run_download(args: argparse.Namespace) -> None:
     client = make_client(args)
-    paths = client.download_trades(
-        args.symbols,
-        args.output_dir,
-        start_date=args.start_date,
-        end_date=args.end_date,
-        extract=not args.no_extract,
-        overwrite=args.overwrite,
-        keep_archive=args.keep_archive,
-        limit=args.limit,
-        sleep_seconds=args.sleep,
-    )
+    files: list[MarketDataFile] = []
+    for symbol in args.symbols:
+        symbol_files = await client.list_trade_files(symbol, start_date=args.start_date, end_date=args.end_date)
+        files.extend(_limited(symbol_files, args.limit))
+
+    semaphore = asyncio.Semaphore(args.max_concurrent)
+
+    async def download(trade_file: MarketDataFile) -> Path:
+        async with semaphore:
+            return await client.download_trade_file(
+                trade_file,
+                args.output_dir,
+                extract=not args.no_extract,
+                overwrite=args.overwrite,
+                keep_archive=args.keep_archive,
+            )
+
+    paths = await asyncio.gather(*(download(trade_file) for trade_file in files))
     for path in paths:
         print(path)
 

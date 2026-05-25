@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import gzip
+import asyncio
 from pathlib import Path
 
 import httpx
 import pytest
 
-from trading.bybit import BybitPublicDataClient
 from trading.providers.base import DownloadCancelled
+from trading.providers.bybit import BybitPublicDataClient
 
 
 class FakeBybitClient(BybitPublicDataClient):
@@ -15,10 +16,10 @@ class FakeBybitClient(BybitPublicDataClient):
         super().__init__(base_url="https://example.test/trading/")
         self.pages = pages
 
-    def _client(self) -> httpx.Client:
-        return httpx.Client(transport=httpx.MockTransport(self._handle_request))
+    def _client(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(transport=httpx.MockTransport(self._handle_request))
 
-    def _handle_request(self, request: httpx.Request) -> httpx.Response:
+    async def _handle_request(self, request: httpx.Request) -> httpx.Response:
         content = self.pages[str(request.url)]
         return httpx.Response(200, content=content, headers={"Content-Length": str(len(content))})
 
@@ -35,7 +36,7 @@ def test_list_symbols_reads_directory_links() -> None:
         }
     )
 
-    assert client.list_symbols() == ["BTCUSDT", "ETHUSDT"]
+    assert asyncio.run(client.list_symbols()) == ["BTCUSDT", "ETHUSDT"]
 
 
 def test_list_trade_files_filters_by_date() -> None:
@@ -50,7 +51,7 @@ def test_list_trade_files_filters_by_date() -> None:
         }
     )
 
-    files = client.list_trade_files("btcusdt", start_date="2020-03-25", end_date="2020-03-26")
+    files = asyncio.run(client.list_trade_files("btcusdt", start_date="2020-03-25", end_date="2020-03-26"))
 
     assert [item.filename for item in files] == ["BTCUSDT2020-03-25.csv.gz", "BTCUSDT2020-03-26.csv.gz"]
     assert files[0].url == "https://example.test/trading/BTCUSDT/BTCUSDT2020-03-25.csv.gz"
@@ -64,9 +65,9 @@ def test_download_trade_file_extracts_gzip(tmp_path: Path) -> None:
             "https://example.test/trading/BTCUSDT/BTCUSDT2020-03-25.csv.gz": archive,
         }
     )
-    trade_file = client.list_trade_files("BTCUSDT")[0]
+    trade_file = asyncio.run(client.list_trade_files("BTCUSDT"))[0]
 
-    path = client.download_trade_file(trade_file, tmp_path)
+    path = asyncio.run(client.download_trade_file(trade_file, tmp_path))
 
     assert path == tmp_path / "BTCUSDT" / "BTCUSDT2020-03-25.csv"
     assert path.read_text() == "timestamp,symbol,price\n1,BTCUSDT,100\n"
@@ -81,10 +82,10 @@ def test_download_trade_file_cleans_partial_file_when_cancelled(tmp_path: Path) 
             "https://example.test/trading/BTCUSDT/BTCUSDT2020-03-25.csv.gz": archive,
         }
     )
-    trade_file = client.list_trade_files("BTCUSDT")[0]
+    trade_file = asyncio.run(client.list_trade_files("BTCUSDT"))[0]
 
     with pytest.raises(DownloadCancelled):
-        client.download_trade_file(trade_file, tmp_path, cancel_callback=lambda: True)
+        asyncio.run(client.download_trade_file(trade_file, tmp_path, cancel_callback=lambda: True))
 
     assert not (tmp_path / "BTCUSDT" / "BTCUSDT2020-03-25.csv.gz.part").exists()
     assert not (tmp_path / "BTCUSDT" / "BTCUSDT2020-03-25.csv.gz").exists()

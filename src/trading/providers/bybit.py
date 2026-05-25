@@ -4,7 +4,6 @@ import csv
 import gzip
 import logging
 import re
-import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, date, datetime
@@ -57,14 +56,14 @@ class BybitPublicDataClient:
         self.timeout = timeout
         self.user_agent = user_agent
 
-    def list_symbols(self) -> list[str]:
+    async def list_symbols(self) -> list[str]:
         logger.debug("Fetching Bybit symbol index from %s", self.base_url)
-        links = self._list_links(self.base_url)
+        links = await self._list_links(self.base_url)
         symbols = sorted({link.rstrip("/") for link in links if self._is_directory_link(link)})
         logger.info("Found %d Bybit symbols", len(symbols))
         return symbols
 
-    def list_trade_files(
+    async def list_trade_files(
         self,
         symbol: str,
         *,
@@ -78,7 +77,7 @@ class BybitPublicDataClient:
 
         logger.debug("Fetching Bybit file index for %s from %s", symbol, symbol_url)
         files: list[MarketDataFile] = []
-        for link in self._list_links(symbol_url):
+        for link in await self._list_links(symbol_url):
             trade_file = self._trade_file_from_link(symbol, symbol_url, link)
             if trade_file is None:
                 continue
@@ -92,7 +91,7 @@ class BybitPublicDataClient:
         logger.info("Found %d Bybit trade files for %s", len(files), symbol)
         return files
 
-    def download_trade_file(
+    async def download_trade_file(
         self,
         trade_file: MarketDataFile,
         output_dir: str | Path,
@@ -116,7 +115,7 @@ class BybitPublicDataClient:
             logger.debug("Using existing archive %s", archive_path)
         else:
             logger.info("Downloading %s to %s", trade_file.url, archive_path)
-            self._download_to_path(trade_file.url, archive_path, progress_callback, cancel_callback)
+            await self._download_to_path(trade_file.url, archive_path, progress_callback, cancel_callback)
 
         if not extract or not trade_file.compressed:
             return archive_path
@@ -130,66 +129,29 @@ class BybitPublicDataClient:
 
         return final_path
 
-    def download_trades(
-        self,
-        symbols: list[str] | tuple[str, ...] | None,
-        output_dir: str | Path,
-        *,
-        start_date: str | date | None = None,
-        end_date: str | date | None = None,
-        extract: bool = True,
-        overwrite: bool = False,
-        keep_archive: bool = False,
-        limit: int | None = None,
-        sleep_seconds: float = 0,
-    ) -> list[Path]:
-        selected_symbols = [normalize_symbol(symbol) for symbol in symbols] if symbols else self.list_symbols()
-        downloaded: list[Path] = []
-
-        for symbol in selected_symbols:
-            files = self.list_trade_files(symbol, start_date=start_date, end_date=end_date)
-            if limit is not None:
-                files = files[:limit]
-
-            for trade_file in files:
-                downloaded.append(
-                    self.download_trade_file(
-                        trade_file,
-                        output_dir,
-                        extract=extract,
-                        overwrite=overwrite,
-                        keep_archive=keep_archive,
-                    )
-                )
-                if sleep_seconds > 0:
-                    time.sleep(sleep_seconds)
-
-        logger.info("Downloaded %d Bybit files", len(downloaded))
-        return downloaded
-
     def iter_trade_rows(self, path: Path, source_file: str) -> Iterator[TradeRow]:
         return iter_trade_rows(path, source_file)
 
-    def _list_links(self, url: str) -> list[str]:
+    async def _list_links(self, url: str) -> list[str]:
         parser = LinkParser()
-        html = self._get(url).text
+        html = (await self._get(url)).text
         parser.feed(html)
         return parser.links
 
-    def _get(self, url: str) -> httpx.Response:
-        with self._client() as client:
-            response = client.get(url)
+    async def _get(self, url: str) -> httpx.Response:
+        async with self._client() as client:
+            response = await client.get(url)
             response.raise_for_status()
             return response
 
-    def _client(self) -> httpx.Client:
-        return httpx.Client(
+    def _client(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
             headers={"User-Agent": self.user_agent},
             timeout=self.timeout,
             follow_redirects=True,
         )
 
-    def _download_to_path(
+    async def _download_to_path(
         self,
         url: str,
         path: Path,
@@ -198,13 +160,15 @@ class BybitPublicDataClient:
     ) -> None:
         partial_path = path.with_name(f"{path.name}.part")
         with remove_partial_on_error(partial_path):
-            with self._client() as client, client.stream("GET", url) as response, partial_path.open("wb") as output:
-                response.raise_for_status()
-                self._copy_response(response, output, progress_callback, cancel_callback)
+            async with self._client() as client:
+                async with client.stream("GET", url) as response:
+                    with partial_path.open("wb") as output:
+                        response.raise_for_status()
+                        await self._copy_response(response, output, progress_callback, cancel_callback)
             partial_path.replace(path)
 
     @staticmethod
-    def _copy_response(
+    async def _copy_response(
         response: httpx.Response,
         output: BinaryIO,
         progress_callback: DownloadProgress | None,
@@ -214,7 +178,7 @@ class BybitPublicDataClient:
         total_bytes = int(content_length) if content_length else None
         downloaded_bytes = 0
 
-        for chunk in response.iter_bytes(1024 * 1024):
+        async for chunk in response.aiter_bytes(1024 * 1024):
             raise_if_cancelled(cancel_callback)
             output.write(chunk)
             downloaded_bytes += len(chunk)
