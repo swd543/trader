@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Sequence
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any, cast
 
-from sqlalchemy import Table, bindparam, func, select, text
+from sqlalchemy import Table, bindparam, func, literal, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, async_sessionmaker
 
@@ -201,6 +202,47 @@ async def upsert_ohlcv_for_source(
         ohlcv_table=ohlcv_model.__tablename__,
         rows_upserted=result.rowcount if result.rowcount is not None else 0,
     )
+
+
+async def source_file_status(
+    engine: AsyncEngine,
+    *,
+    provider: str,
+    symbol: str,
+    source_file: str,
+    trade_date: date,
+    timeframe: str,
+) -> dict[str, bool]:
+    normalized_provider = normalize_provider(provider)
+    normalized_symbol = normalize_symbol(symbol)
+    trade_model = trade_model_for_symbol(normalized_provider, normalized_symbol)
+    ohlcv_model = ohlcv_model_for_symbol(normalized_provider, normalized_symbol)
+    day_start = datetime.combine(trade_date, time.min, tzinfo=UTC)
+    day_end = day_start + timedelta(days=1)
+
+    async with engine.connect() as conn:
+        has_trades = bool(
+            await conn.scalar(
+                select(literal(True))
+                .select_from(trade_model)
+                .where(trade_model.source_file == source_file)
+                .limit(1)
+            )
+        )
+        has_ohlcv = bool(
+            await conn.scalar(
+                select(literal(True))
+                .select_from(ohlcv_model)
+                .where(
+                    ohlcv_model.timeframe == timeframe,
+                    ohlcv_model.bucket >= day_start,
+                    ohlcv_model.bucket < day_end,
+                )
+                .limit(1)
+            )
+        )
+
+    return {"trades": has_trades, "ohlcv": has_ohlcv}
 
 
 async def compress_old_chunks(
