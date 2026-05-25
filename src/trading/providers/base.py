@@ -7,8 +7,13 @@ from pathlib import Path
 from typing import Protocol
 
 type DownloadProgress = Callable[[int, int | None], None]
+type CancelCheck = Callable[[], bool]
 type InsertProgress = Callable[[int], None]
 type TradeRow = tuple[datetime, str, str, float, float, str, str, float | None, float | None, float | None, str]
+
+
+class DownloadCancelled(RuntimeError):
+    """Raised when a market-data download job is cancelled."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,6 +58,7 @@ class HistoricalTradeProvider(Protocol):
         overwrite: bool = False,
         keep_archive: bool = False,
         progress_callback: DownloadProgress | None = None,
+        cancel_callback: CancelCheck | None = None,
     ) -> Path: ...
 
     def iter_trade_rows(self, path: Path, source_file: str) -> Iterator[TradeRow]: ...

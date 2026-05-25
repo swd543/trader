@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import gzip
-from io import BytesIO
 from pathlib import Path
 
+import httpx
+import pytest
+
 from trading.bybit import BybitPublicDataClient
+from trading.providers.base import DownloadCancelled
 
 
 class FakeBybitClient(BybitPublicDataClient):
@@ -12,8 +15,12 @@ class FakeBybitClient(BybitPublicDataClient):
         super().__init__(base_url="https://example.test/trading/")
         self.pages = pages
 
-    def _open_binary(self, url: str) -> BytesIO:
-        return BytesIO(self.pages[url])
+    def _client(self) -> httpx.Client:
+        return httpx.Client(transport=httpx.MockTransport(self._handle_request))
+
+    def _handle_request(self, request: httpx.Request) -> httpx.Response:
+        content = self.pages[str(request.url)]
+        return httpx.Response(200, content=content, headers={"Content-Length": str(len(content))})
 
 
 def test_list_symbols_reads_directory_links() -> None:
@@ -63,4 +70,21 @@ def test_download_trade_file_extracts_gzip(tmp_path: Path) -> None:
 
     assert path == tmp_path / "BTCUSDT" / "BTCUSDT2020-03-25.csv"
     assert path.read_text() == "timestamp,symbol,price\n1,BTCUSDT,100\n"
+    assert not (tmp_path / "BTCUSDT" / "BTCUSDT2020-03-25.csv.gz").exists()
+
+
+def test_download_trade_file_cleans_partial_file_when_cancelled(tmp_path: Path) -> None:
+    archive = gzip.compress(b"timestamp,symbol,price\n1,BTCUSDT,100\n")
+    client = FakeBybitClient(
+        {
+            "https://example.test/trading/BTCUSDT/": b'<a href="BTCUSDT2020-03-25.csv.gz">file</a>',
+            "https://example.test/trading/BTCUSDT/BTCUSDT2020-03-25.csv.gz": archive,
+        }
+    )
+    trade_file = client.list_trade_files("BTCUSDT")[0]
+
+    with pytest.raises(DownloadCancelled):
+        client.download_trade_file(trade_file, tmp_path, cancel_callback=lambda: True)
+
+    assert not (tmp_path / "BTCUSDT" / "BTCUSDT2020-03-25.csv.gz.part").exists()
     assert not (tmp_path / "BTCUSDT" / "BTCUSDT2020-03-25.csv.gz").exists()

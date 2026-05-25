@@ -4,18 +4,19 @@ import csv
 import gzip
 import logging
 import re
-import shutil
 import time
 from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, date, datetime
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import BinaryIO
 from urllib.parse import urljoin
-from urllib.request import Request, urlopen
+
+import httpx
 
 from trading.models import normalize_symbol
-from trading.providers.base import DownloadProgress, MarketDataFile, TradeRow
+from trading.providers.base import CancelCheck, DownloadCancelled, DownloadProgress, MarketDataFile, TradeRow
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +101,7 @@ class BybitPublicDataClient:
         overwrite: bool = False,
         keep_archive: bool = False,
         progress_callback: DownloadProgress | None = None,
+        cancel_callback: CancelCheck | None = None,
     ) -> Path:
         symbol_dir = Path(output_dir) / trade_file.symbol
         symbol_dir.mkdir(parents=True, exist_ok=True)
@@ -114,15 +116,13 @@ class BybitPublicDataClient:
             logger.debug("Using existing archive %s", archive_path)
         else:
             logger.info("Downloading %s to %s", trade_file.url, archive_path)
-            with self._open_binary(trade_file.url) as response, archive_path.open("wb") as output:
-                self._copy_response(response, output, progress_callback)
+            self._download_to_path(trade_file.url, archive_path, progress_callback, cancel_callback)
 
         if not extract or not trade_file.compressed:
             return archive_path
 
         logger.info("Extracting %s to %s", archive_path, final_path)
-        with gzip.open(archive_path, "rb") as compressed, final_path.open("wb") as output:
-            shutil.copyfileobj(compressed, output)
+        self._extract_gzip_to_path(archive_path, final_path, cancel_callback)
 
         if not keep_archive:
             archive_path.unlink()
@@ -172,37 +172,68 @@ class BybitPublicDataClient:
 
     def _list_links(self, url: str) -> list[str]:
         parser = LinkParser()
-        with self._open_text(url) as response:
-            html = response.read().decode("utf-8", errors="replace")
+        html = self._get(url).text
         parser.feed(html)
         return parser.links
 
-    def _open_text(self, url: str) -> BinaryIO:
-        return self._open_binary(url)
+    def _get(self, url: str) -> httpx.Response:
+        with self._client() as client:
+            response = client.get(url)
+            response.raise_for_status()
+            return response
 
-    def _open_binary(self, url: str) -> BinaryIO:
-        request = Request(url, headers={"User-Agent": self.user_agent})
-        return urlopen(request, timeout=self.timeout)
+    def _client(self) -> httpx.Client:
+        return httpx.Client(
+            headers={"User-Agent": self.user_agent},
+            timeout=self.timeout,
+            follow_redirects=True,
+        )
+
+    def _download_to_path(
+        self,
+        url: str,
+        path: Path,
+        progress_callback: DownloadProgress | None,
+        cancel_callback: CancelCheck | None,
+    ) -> None:
+        partial_path = path.with_name(f"{path.name}.part")
+        with remove_partial_on_error(partial_path):
+            with self._client() as client, client.stream("GET", url) as response, partial_path.open("wb") as output:
+                response.raise_for_status()
+                self._copy_response(response, output, progress_callback, cancel_callback)
+            partial_path.replace(path)
 
     @staticmethod
     def _copy_response(
-        response: BinaryIO,
+        response: httpx.Response,
         output: BinaryIO,
         progress_callback: DownloadProgress | None,
+        cancel_callback: CancelCheck | None,
     ) -> None:
-        if progress_callback is None:
-            shutil.copyfileobj(response, output)
-            return
-
-        headers = getattr(response, "headers", {})
-        content_length = headers.get("Content-Length") if headers else None
+        content_length = response.headers.get("Content-Length")
         total_bytes = int(content_length) if content_length else None
         downloaded_bytes = 0
 
-        while chunk := response.read(1024 * 1024):
+        for chunk in response.iter_bytes(1024 * 1024):
+            raise_if_cancelled(cancel_callback)
             output.write(chunk)
             downloaded_bytes += len(chunk)
-            progress_callback(downloaded_bytes, total_bytes)
+            if progress_callback is not None:
+                progress_callback(downloaded_bytes, total_bytes)
+
+    @staticmethod
+    def _extract_gzip_to_path(
+        archive_path: Path,
+        final_path: Path,
+        cancel_callback: CancelCheck | None,
+    ) -> None:
+        partial_path = final_path.with_name(f"{final_path.name}.part")
+        with remove_partial_on_error(partial_path):
+            with gzip.open(archive_path, "rb") as compressed, partial_path.open("wb") as output:
+                while chunk := compressed.read(1024 * 1024):
+                    raise_if_cancelled(cancel_callback)
+                    output.write(chunk)
+            partial_path.replace(final_path)
 
     def _symbol_url(self, symbol: str) -> str:
         return urljoin(self.base_url, f"{symbol}/")
@@ -261,3 +292,17 @@ def _optional_float(value: str | None) -> float | None:
     if value is None or value == "":
         return None
     return float(value)
+
+
+def raise_if_cancelled(cancel_callback: CancelCheck | None) -> None:
+    if cancel_callback is not None and cancel_callback():
+        raise DownloadCancelled("Download job cancelled")
+
+
+@contextmanager
+def remove_partial_on_error(path: Path) -> Iterator[None]:
+    try:
+        yield
+    except Exception:
+        path.unlink(missing_ok=True)
+        raise
