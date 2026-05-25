@@ -348,6 +348,21 @@ def run_download_job_worker(
     cleanup_files: bool,
 ) -> None:
     try:
+        logger.info(
+            "Download and ingest job started",
+            extra={
+                "event": "download_ingest.started",
+                "job_id": job.id,
+                "provider": client.slug,
+                "symbols": selected_symbols,
+                "start_date": start.isoformat(),
+                "end_date": end.isoformat(),
+                "output_dir": str(output_dir),
+                "max_concurrent": max_concurrent,
+                "overwrite": overwrite,
+                "cleanup_files": cleanup_files,
+            },
+        )
         update_download_job(job, message="Collecting files", overall_text="Collecting files")
         raise_if_job_cancelled(job)
         files = run_async(collect_trade_files(client, selected_symbols, start, end))
@@ -384,6 +399,10 @@ def run_download_job_worker(
             overall_fraction=1.0,
             overall_text="Complete",
         )
+        logger.info(
+            "Download and ingest job completed",
+            extra={"event": "download_ingest.completed", "job_id": job.id, "provider": client.slug},
+        )
     except DownloadCancelled:
         mark_unfinished_download_files(job, "cancelled")
         update_download_job(
@@ -393,8 +412,23 @@ def run_download_job_worker(
             download_text="Cancelled",
             ingest_text="Cancelled",
         )
+        logger.info(
+            "Download and ingest job cancelled",
+            extra={"event": "download_ingest.cancelled", "job_id": job.id, "provider": client.slug},
+        )
     except Exception as error:
-        logger.exception("Download and ingest job failed")
+        logger.exception(
+            "Download and ingest job failed",
+            extra={
+                "event": "download_ingest.failed",
+                "job_id": job.id,
+                "provider": client.slug,
+                "symbols": selected_symbols,
+                "start_date": start.isoformat(),
+                "end_date": end.isoformat(),
+                "output_dir": str(output_dir),
+            },
+        )
         mark_unfinished_download_files(job, "failed")
         update_download_job(job, status="failed", message=f"Job failed: {error}", error=str(error))
 

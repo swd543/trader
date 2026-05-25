@@ -25,6 +25,23 @@ uv run trading files BTCUSDT --start-date 2020-03-25 --end-date 2020-03-26
 uv run trading -v download BTCUSDT --start-date 2020-03-25 --limit 1
 ```
 
+Emit OpenTelemetry-shaped JSON logs from the CLI:
+
+```sh
+uv run trading --log-format json -v symbols --limit 10
+```
+
+For the Streamlit app, use environment variables:
+
+```sh
+TRADING_LOG_FORMAT=json TRADING_LOG_LEVEL=INFO uv run trading-app
+```
+
+The JSON log format uses OpenTelemetry log-record field names such as
+`time_unix_nano`, `severity_text`, `severity_number`, `body`, `resource`,
+`scope`, and `attributes`. `TRADING_LOG_FORMAT=otel` is accepted as an explicit
+alias for the same output shape.
+
 Use the client library directly:
 
 ```python

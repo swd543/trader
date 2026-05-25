@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import logging
 from pathlib import Path
 from typing import Any
 
+from trading.logging_config import configure_logging, level_from_verbosity
 from trading.providers import (
     HistoricalTradeProvider,
     MarketDataFile,
@@ -20,13 +20,19 @@ from trading.providers import (
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
-    configure_logging(args.verbose)
+    configure_logging(level=level_from_verbosity(args.verbose), log_format=args.log_format)
     asyncio.run(args.func(args))
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="trading", description="Trading data utilities.")
     parser.add_argument("-v", "--verbose", action="count", default=0, help="Increase log verbosity.")
+    parser.add_argument(
+        "--log-format",
+        choices=("text", "json", "otel"),
+        default=None,
+        help="Log output format. json and otel emit OpenTelemetry-shaped log records. Defaults to TRADING_LOG_FORMAT or text.",
+    )
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -145,16 +151,6 @@ def argparse_type(option: ProviderOption) -> type[Any]:
     if option.value_type == "float":
         return float
     return str
-
-
-def configure_logging(verbosity: int) -> None:
-    level = logging.WARNING
-    if verbosity == 1:
-        level = logging.INFO
-    elif verbosity >= 2:
-        level = logging.DEBUG
-
-    logging.basicConfig(level=level, format="%(levelname)s %(name)s: %(message)s")
 
 
 def _limited[T](items: list[T], limit: int | None) -> list[T]:

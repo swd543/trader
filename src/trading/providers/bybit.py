@@ -88,10 +88,16 @@ class BybitPublicDataClient(HistoricalTradeProvider):
         self.user_agent = user_agent
 
     async def list_symbols(self) -> list[str]:
-        logger.debug("Fetching Bybit symbol index from %s", self.base_url)
+        logger.debug(
+            "Fetching Bybit symbol index",
+            extra={"event": "provider.symbols.fetch", "provider": self.slug, "url": self.base_url},
+        )
         links = await self._list_links(self.base_url)
         symbols = sorted({link.rstrip("/") for link in links if self._is_directory_link(link)})
-        logger.info("Found %d Bybit symbols", len(symbols))
+        logger.info(
+            "Found Bybit symbols",
+            extra={"event": "provider.symbols.found", "provider": self.slug, "symbol_count": len(symbols)},
+        )
         return symbols
 
     async def list_trade_files(
@@ -106,7 +112,10 @@ class BybitPublicDataClient(HistoricalTradeProvider):
         end = self._parse_optional_date(end_date)
         symbol_url = self._symbol_url(symbol)
 
-        logger.debug("Fetching Bybit file index for %s from %s", symbol, symbol_url)
+        logger.debug(
+            "Fetching Bybit file index",
+            extra={"event": "provider.files.fetch", "provider": self.slug, "symbol": symbol, "url": symbol_url},
+        )
         files: list[MarketDataFile] = []
         for link in await self._list_links(symbol_url):
             trade_file = self._trade_file_from_link(symbol, symbol_url, link)
@@ -119,7 +128,10 @@ class BybitPublicDataClient(HistoricalTradeProvider):
             files.append(trade_file)
 
         files.sort(key=lambda item: (item.trade_date, item.filename))
-        logger.info("Found %d Bybit trade files for %s", len(files), symbol)
+        logger.info(
+            "Found Bybit trade files",
+            extra={"event": "provider.files.found", "provider": self.slug, "symbol": symbol, "file_count": len(files)},
+        )
         return files
 
     async def download_trade_file(
@@ -138,25 +150,72 @@ class BybitPublicDataClient(HistoricalTradeProvider):
 
         final_path = symbol_dir / (trade_file.csv_filename if extract else trade_file.filename)
         if final_path.exists() and not overwrite:
-            logger.info("Skipping %s because %s already exists", trade_file.filename, final_path)
+            logger.info(
+                "Skipping existing trade file",
+                extra={
+                    "event": "provider.download.skip_existing",
+                    "provider": self.slug,
+                    "symbol": trade_file.symbol,
+                    "filename": trade_file.filename,
+                    "path": str(final_path),
+                },
+            )
             return final_path
 
         archive_path = symbol_dir / trade_file.filename
         if archive_path.exists() and not overwrite:
-            logger.debug("Using existing archive %s", archive_path)
+            logger.debug(
+                "Using existing archive",
+                extra={
+                    "event": "provider.download.use_existing_archive",
+                    "provider": self.slug,
+                    "symbol": trade_file.symbol,
+                    "filename": trade_file.filename,
+                    "path": str(archive_path),
+                },
+            )
         else:
-            logger.info("Downloading %s to %s", trade_file.url, archive_path)
+            logger.info(
+                "Downloading trade file",
+                extra={
+                    "event": "provider.download.start",
+                    "provider": self.slug,
+                    "symbol": trade_file.symbol,
+                    "filename": trade_file.filename,
+                    "url": trade_file.url,
+                    "path": str(archive_path),
+                },
+            )
             await self._download_to_path(trade_file.url, archive_path, progress_callback, cancel_callback)
 
         if not extract or not trade_file.compressed:
             return archive_path
 
-        logger.info("Extracting %s to %s", archive_path, final_path)
+        logger.info(
+            "Extracting trade archive",
+            extra={
+                "event": "provider.download.extract",
+                "provider": self.slug,
+                "symbol": trade_file.symbol,
+                "filename": trade_file.filename,
+                "archive_path": str(archive_path),
+                "path": str(final_path),
+            },
+        )
         self._extract_gzip_to_path(archive_path, final_path, cancel_callback)
 
         if not keep_archive:
             archive_path.unlink()
-            logger.debug("Removed archive %s", archive_path)
+            logger.debug(
+                "Removed trade archive",
+                extra={
+                    "event": "provider.download.archive_removed",
+                    "provider": self.slug,
+                    "symbol": trade_file.symbol,
+                    "filename": trade_file.filename,
+                    "path": str(archive_path),
+                },
+            )
 
         return final_path
 
