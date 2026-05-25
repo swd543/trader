@@ -11,6 +11,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import BinaryIO
 from urllib.parse import urljoin
+from uuid import uuid4
 
 import httpx
 
@@ -263,10 +264,12 @@ class BybitPublicDataClient(HistoricalTradeProvider):
         progress_callback: DownloadProgress | None,
         cancel_callback: CancelCheck | None,
     ) -> None:
-        partial_path = path.with_name(f"{path.name}.part")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        partial_path = unique_partial_path(path)
         with remove_partial_on_error(partial_path):
             async with self._client() as client:
                 async with client.stream("GET", url) as response:
+                    path.parent.mkdir(parents=True, exist_ok=True)
                     with partial_path.open("wb") as output:
                         response.raise_for_status()
                         await self._copy_response(response, output, progress_callback, cancel_callback)
@@ -296,7 +299,8 @@ class BybitPublicDataClient(HistoricalTradeProvider):
         final_path: Path,
         cancel_callback: CancelCheck | None,
     ) -> None:
-        partial_path = final_path.with_name(f"{final_path.name}.part")
+        final_path.parent.mkdir(parents=True, exist_ok=True)
+        partial_path = unique_partial_path(final_path)
         with remove_partial_on_error(partial_path):
             with gzip.open(archive_path, "rb") as compressed, partial_path.open("wb") as output:
                 while chunk := compressed.read(1024 * 1024):
@@ -347,6 +351,10 @@ class BybitPublicDataClient(HistoricalTradeProvider):
 def raise_if_cancelled(cancel_callback: CancelCheck | None) -> None:
     if cancel_callback is not None and cancel_callback():
         raise DownloadCancelled("Download job cancelled")
+
+
+def unique_partial_path(path: Path) -> Path:
+    return path.with_name(f"{path.name}.{uuid4().hex}.part")
 
 
 @contextmanager

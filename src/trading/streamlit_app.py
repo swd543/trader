@@ -1025,12 +1025,6 @@ def cleanup_downloaded_file(path: Path, output_dir: Path) -> bool:
         target.unlink()
         deleted = True
 
-    parent = target.parent
-    while parent != output_root and output_root in parent.parents:
-        with suppress(OSError):
-            parent.rmdir()
-        parent = parent.parent
-
     return deleted
 
 

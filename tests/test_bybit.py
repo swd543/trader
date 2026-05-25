@@ -87,5 +87,24 @@ def test_download_trade_file_cleans_partial_file_when_cancelled(tmp_path: Path) 
     with pytest.raises(DownloadCancelled):
         asyncio.run(client.download_trade_file(trade_file, tmp_path, cancel_callback=lambda: True))
 
-    assert not (tmp_path / "BTCUSDT" / "BTCUSDT2020-03-25.csv.gz.part").exists()
+    assert not list((tmp_path / "BTCUSDT").glob("*.part"))
     assert not (tmp_path / "BTCUSDT" / "BTCUSDT2020-03-25.csv.gz").exists()
+
+
+def test_download_trade_file_recreates_symbol_dir_for_partial_file(tmp_path: Path) -> None:
+    archive = gzip.compress(b"timestamp,symbol,price\n1,BTCUSDT,100\n")
+    client = FakeBybitClient(
+        {
+            "https://example.test/trading/BTCUSDT/": b'<a href="BTCUSDT2020-03-25.csv.gz">file</a>',
+            "https://example.test/trading/BTCUSDT/BTCUSDT2020-03-25.csv.gz": archive,
+        }
+    )
+    trade_file = asyncio.run(client.list_trade_files("BTCUSDT"))[0]
+    symbol_dir = tmp_path / "BTCUSDT"
+    symbol_dir.mkdir()
+    symbol_dir.rmdir()
+
+    path = asyncio.run(client.download_trade_file(trade_file, tmp_path))
+
+    assert path.exists()
+    assert not list(symbol_dir.glob("*.part"))
