@@ -41,6 +41,7 @@ from trading.providers import (
 from trading.providers.base import DownloadCancelled
 
 TIMEFRAMES = ("1 minute", "5 minutes", "15 minutes", "1 hour", "6 hours", "12 hours", "1 day")
+DEFAULT_CHART_TIMEFRAME = "1 hour"
 DOWNLOAD_JOB_KEY = "download_job"
 DEFAULT_CHART_ROWS = 5_000
 CHART_LOAD_STEP = 5_000
@@ -1009,7 +1010,11 @@ def ohlcv_panel(db_config: DatabaseConfig, provider_slug: str, selected_symbols:
     with controls[0]:
         symbol = st.selectbox("Symbol", options=["", *selected_symbols], format_func=lambda value: value or "All selected")
     with controls[1]:
-        timeframe = st.selectbox("Chart timeframe", options=TIMEFRAMES)
+        timeframe = st.selectbox(
+            "Chart timeframe",
+            options=TIMEFRAMES,
+            index=TIMEFRAMES.index(DEFAULT_CHART_TIMEFRAME),
+        )
     with controls[2]:
         y_axis = st.segmented_control("Y axis", options=("Linear", "Log"), default="Linear")
     with controls[3]:
