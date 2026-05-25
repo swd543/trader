@@ -15,7 +15,15 @@ from urllib.parse import urljoin
 import httpx
 
 from trading.models import normalize_symbol
-from trading.providers.base import CancelCheck, DownloadCancelled, DownloadProgress, MarketDataFile, TradeRow
+from trading.providers.base import (
+    CancelCheck,
+    DownloadCancelled,
+    DownloadProgress,
+    HistoricalTradeProvider,
+    MarketDataFile,
+    ProviderOption,
+    TradeRow,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +33,7 @@ DEFAULT_USER_AGENT = "trading-bybit-client/0.1"
 TRADE_FILE_PATTERN = re.compile(r"(?P<symbol>.+?)(?P<date>\d{4}-\d{2}-\d{2})\.csv(?:\.gz)?$")
 
 
-class LinkParser(HTMLParser):
+class _LinkParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__()
         self.links: list[str] = []
@@ -39,11 +47,34 @@ class LinkParser(HTMLParser):
                 self.links.append(value)
 
 
-class BybitPublicDataClient:
+class BybitPublicDataClient(HistoricalTradeProvider):
     """Client for Bybit's public trade-data archive."""
 
     slug = "bybit"
     display_name = "Bybit"
+    default_output_dir = "data/bybit"
+
+    @classmethod
+    def option_specs(cls) -> tuple[ProviderOption, ...]:
+        return (
+            ProviderOption(
+                name="base_url",
+                label="Bybit base URL",
+                default=DEFAULT_BASE_URL,
+                value_type="str",
+                help="Public Bybit trade archive root URL.",
+            ),
+            ProviderOption(
+                name="timeout",
+                label="HTTP timeout",
+                default=DEFAULT_TIMEOUT_SECONDS,
+                value_type="float",
+                min_value=5,
+                max_value=180,
+                step=5,
+                help="HTTP timeout in seconds.",
+            ),
+        )
 
     def __init__(
         self,
@@ -130,10 +161,25 @@ class BybitPublicDataClient:
         return final_path
 
     def iter_trade_rows(self, path: Path, source_file: str) -> Iterator[TradeRow]:
-        return iter_trade_rows(path, source_file)
+        with path.open(newline="") as file:
+            reader = csv.DictReader(file)
+            for row in reader:
+                yield (
+                    datetime.fromtimestamp(float(row["timestamp"]), UTC),
+                    normalize_symbol(row["symbol"]),
+                    row["side"],
+                    float(row["size"]),
+                    float(row["price"]),
+                    row.get("tickDirection") or "",
+                    row["trdMatchID"],
+                    self._optional_float(row.get("grossValue")),
+                    self._optional_float(row.get("homeNotional")),
+                    self._optional_float(row.get("foreignNotional")),
+                    source_file,
+                )
 
     async def _list_links(self, url: str) -> list[str]:
-        parser = LinkParser()
+        parser = _LinkParser()
         html = (await self._get(url)).text
         parser.feed(html)
         return parser.links
@@ -232,30 +278,11 @@ class BybitPublicDataClient:
             return value
         return date.fromisoformat(value)
 
-
-def iter_trade_rows(path: Path, source_file: str) -> Iterator[TradeRow]:
-    with path.open(newline="") as file:
-        reader = csv.DictReader(file)
-        for row in reader:
-            yield (
-                datetime.fromtimestamp(float(row["timestamp"]), UTC),
-                normalize_symbol(row["symbol"]),
-                row["side"],
-                float(row["size"]),
-                float(row["price"]),
-                row.get("tickDirection") or "",
-                row["trdMatchID"],
-                _optional_float(row.get("grossValue")),
-                _optional_float(row.get("homeNotional")),
-                _optional_float(row.get("foreignNotional")),
-                source_file,
-            )
-
-
-def _optional_float(value: str | None) -> float | None:
-    if value is None or value == "":
-        return None
-    return float(value)
+    @staticmethod
+    def _optional_float(value: str | None) -> float | None:
+        if value is None or value == "":
+            return None
+        return float(value)
 
 
 def raise_if_cancelled(cancel_callback: CancelCheck | None) -> None:

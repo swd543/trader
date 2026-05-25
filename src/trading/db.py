@@ -65,6 +65,7 @@ async def import_trade_csv(
     symbol: str | None = None,
     row_iterator: Callable[[Path, str], Iterator[TradeRow]],
     progress_callback: Callable[[int], None] | None = None,
+    ensure_symbol_schema: bool = True,
 ) -> ImportResult:
     normalized_provider = normalize_provider(provider)
     source_file = path.name
@@ -75,7 +76,8 @@ async def import_trade_csv(
     ohlcv_table = ohlcv_model.__tablename__
 
     async with engine.begin() as conn:
-        await _ensure_symbol_schema(conn, normalized_provider, normalized_symbol)
+        if ensure_symbol_schema:
+            await _ensure_symbol_schema(conn, normalized_provider, normalized_symbol)
         await conn.execute(
             text(
                 f"""
@@ -142,6 +144,7 @@ async def upsert_ohlcv_for_source(
     *,
     provider: str = "bybit",
     symbol: str | None = None,
+    ensure_symbol_schema: bool = True,
 ) -> AggregateResult:
     normalized_provider = normalize_provider(provider)
     normalized_symbol = normalize_symbol(symbol) if symbol else symbol_from_source_file(source_file)
@@ -194,7 +197,8 @@ async def upsert_ohlcv_for_source(
     )
 
     async with engine.begin() as conn:
-        await _ensure_symbol_schema(conn, normalized_provider, normalized_symbol)
+        if ensure_symbol_schema:
+            await _ensure_symbol_schema(conn, normalized_provider, normalized_symbol)
         result = await conn.execute(upsert_statement, {"source_file": source_file})
     return AggregateResult(
         provider=normalized_provider,
@@ -301,12 +305,7 @@ async def latest_ohlcv(
 ) -> list[OhlcvRow]:
     normalized_provider = normalize_provider(provider)
     existing_symbols = set(await list_ingested_symbols(engine, provider=normalized_provider))
-    if symbol:
-        selected_symbols = [normalize_symbol(symbol)]
-    elif symbols:
-        selected_symbols = [normalize_symbol(item) for item in symbols]
-    else:
-        selected_symbols = sorted(existing_symbols)
+    selected_symbols = _select_symbols(existing_symbols, symbol=symbol, symbols=symbols)
     requested_timeframe = timeframe or BASE_OHLCV_TIMEFRAME
 
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
@@ -359,12 +358,7 @@ async def latest_trade_markers(
 ) -> list[TradeMarkerRow]:
     normalized_provider = normalize_provider(provider)
     existing_symbols = set(await list_ingested_symbols(engine, provider=normalized_provider))
-    if symbol:
-        selected_symbols = [normalize_symbol(symbol)]
-    elif symbols:
-        selected_symbols = [normalize_symbol(item) for item in symbols]
-    else:
-        selected_symbols = sorted(existing_symbols)
+    selected_symbols = _select_symbols(existing_symbols, symbol=symbol, symbols=symbols)
 
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     rows: list[TradeMarkerRow] = []
@@ -396,6 +390,19 @@ async def list_ingested_symbols(engine: AsyncEngine, *, provider: str = "bybit")
     normalized_provider = normalize_provider(provider)
     async with engine.connect() as conn:
         return await _existing_symbols(conn, normalized_provider)
+
+
+def _select_symbols(
+    existing_symbols: set[str],
+    *,
+    symbol: str | None,
+    symbols: Sequence[str] | None,
+) -> list[str]:
+    if symbol:
+        return [normalize_symbol(symbol)]
+    if symbols:
+        return [normalize_symbol(item) for item in symbols]
+    return sorted(existing_symbols)
 
 
 async def _ensure_symbol_schema(

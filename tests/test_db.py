@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from pathlib import Path
 
-from trading.providers.bybit import iter_trade_rows
+from trading.providers.bybit import BybitPublicDataClient
 
 
 def test_iter_bybit_trade_rows_parses_bybit_csv(tmp_path: Path) -> None:
@@ -18,7 +18,7 @@ def test_iter_bybit_trade_rows_parses_bybit_csv(tmp_path: Path) -> None:
         + "\n"
     )
 
-    rows = list(iter_trade_rows(path, path.name))
+    rows = list(BybitPublicDataClient().iter_trade_rows(path, path.name))
 
     assert rows == [
         (

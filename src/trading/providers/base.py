@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
-from typing import Protocol
+from typing import ClassVar, Literal
 
 type DownloadProgress = Callable[[int, int | None], None]
 type CancelCheck = Callable[[], bool]
@@ -34,12 +35,38 @@ class MarketDataFile:
         return self.filename
 
 
-class HistoricalTradeProvider(Protocol):
-    slug: str
-    display_name: str
+@dataclass(frozen=True, slots=True)
+class ProviderOption:
+    name: str
+    label: str
+    default: str | int | float | bool
+    value_type: Literal["str", "int", "float", "bool"]
+    help: str | None = None
+    min_value: int | float | None = None
+    max_value: int | float | None = None
+    step: int | float | None = None
 
+    @property
+    def flag(self) -> str:
+        return f"--{self.name.replace('_', '-')}"
+
+
+class HistoricalTradeProvider(ABC):
+    slug: ClassVar[str]
+    display_name: ClassVar[str]
+    default_output_dir: ClassVar[str]
+
+    @classmethod
+    def option_specs(cls) -> tuple[ProviderOption, ...]:
+        return ()
+
+    def cache_options(self) -> tuple[tuple[str, object], ...]:
+        return tuple((option.name, getattr(self, option.name)) for option in self.option_specs())
+
+    @abstractmethod
     async def list_symbols(self) -> list[str]: ...
 
+    @abstractmethod
     async def list_trade_files(
         self,
         symbol: str,
@@ -48,6 +75,7 @@ class HistoricalTradeProvider(Protocol):
         end_date: str | date | None = None,
     ) -> list[MarketDataFile]: ...
 
+    @abstractmethod
     async def download_trade_file(
         self,
         trade_file: MarketDataFile,
@@ -60,4 +88,5 @@ class HistoricalTradeProvider(Protocol):
         cancel_callback: CancelCheck | None = None,
     ) -> Path: ...
 
+    @abstractmethod
     def iter_trade_rows(self, path: Path, source_file: str) -> Iterator[TradeRow]: ...

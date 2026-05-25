@@ -14,6 +14,7 @@ from uuid import uuid4
 
 import streamlit as st
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from trading.charts import build_price_figure, normalize_ohlcv_chart_row, normalize_trade_marker_chart_row
 from trading.db import (
@@ -28,7 +29,15 @@ from trading.db import (
     upsert_ohlcv_for_source,
 )
 from trading.models import DatabaseConfig
-from trading.providers import HistoricalTradeProvider, MarketDataFile, create_provider, provider_names
+from trading.providers import (
+    HistoricalTradeProvider,
+    MarketDataFile,
+    ProviderOption,
+    create_provider,
+    provider_display_name,
+    provider_names,
+    provider_option_specs,
+)
 from trading.providers.base import DownloadCancelled
 
 TIMEFRAMES = ("1 minute", "5 minutes", "15 minutes", "1 hour", "6 hours", "12 hours", "1 day")
@@ -100,14 +109,47 @@ def sidebar_database_config() -> DatabaseConfig:
 
 def sidebar_provider_config() -> tuple[str, dict[str, object]]:
     st.sidebar.header("Market Data")
-    selected_provider = st.sidebar.selectbox("Provider", options=provider_names(), format_func=str.title)
-    provider_options: dict[str, object] = {}
+    selected_provider = st.sidebar.selectbox(
+        "Provider",
+        options=provider_names(),
+        format_func=provider_display_name,
+    )
+    provider_slug = str(selected_provider)
 
-    if selected_provider == "bybit":
-        provider_options["base_url"] = st.sidebar.text_input("Bybit base URL", value="https://public.bybit.com/trading/")
-        provider_options["timeout"] = float(st.sidebar.number_input("HTTP timeout", min_value=5, max_value=180, value=30, step=5))
+    provider_options = {
+        option.name: render_provider_option(option)
+        for option in provider_option_specs(provider_slug)
+    }
 
-    return selected_provider, provider_options
+    return provider_slug, provider_options
+
+
+def render_provider_option(option: ProviderOption) -> object:
+    if option.value_type == "bool":
+        return st.sidebar.checkbox(option.label, value=bool(option.default), help=option.help)
+    if option.value_type == "int":
+        return int(
+            st.sidebar.number_input(
+                option.label,
+                value=int(option.default),
+                min_value=int(option.min_value) if option.min_value is not None else None,
+                max_value=int(option.max_value) if option.max_value is not None else None,
+                step=int(option.step) if option.step is not None else 1,
+                help=option.help,
+            )
+        )
+    if option.value_type == "float":
+        return float(
+            st.sidebar.number_input(
+                option.label,
+                value=float(option.default),
+                min_value=float(option.min_value) if option.min_value is not None else None,
+                max_value=float(option.max_value) if option.max_value is not None else None,
+                step=float(option.step) if option.step is not None else 1.0,
+                help=option.help,
+            )
+        )
+    return st.sidebar.text_input(option.label, value=str(option.default), help=option.help)
 
 
 def show_database_status(db_config: DatabaseConfig, provider_slug: str) -> None:
@@ -224,7 +266,7 @@ def download_panel(
 
     options = st.columns([2, 1, 1, 1])
     with options[0]:
-        output_dir = Path(st.text_input("Output directory", value=f"data/{client.slug}"))
+        output_dir = Path(st.text_input("Output directory", value=client.default_output_dir))
     with options[1]:
         max_concurrent = st.number_input("Max concurrent files", min_value=1, max_value=8, value=8, step=1)
     with options[2]:
@@ -358,19 +400,8 @@ def run_download_job_worker(
 
 def current_download_job() -> DownloadJob | None:
     job = st.session_state.get(DOWNLOAD_JOB_KEY)
-    if job is None:
-        return None
-
-    required_attributes = (
-        "status",
-        "thread",
-        "lock",
-        "cancel_event",
-        "log_rows",
-        "file_rows",
-    )
-    if all(hasattr(job, attribute) for attribute in required_attributes):
-        return cast(DownloadJob, job)
+    if isinstance(job, DownloadJob):
+        return job
     return None
 
 
@@ -621,7 +652,7 @@ async def download_and_ingest_files(
 
 
 async def plan_ingestion_work(
-    engine: Any,
+    engine: AsyncEngine,
     client: HistoricalTradeProvider,
     files: list[MarketDataFile],
     output_dir: Path,
@@ -716,7 +747,7 @@ async def plan_ingestion_work(
 
 
 async def aggregate_existing_source(
-    engine: Any,
+    engine: AsyncEngine,
     client: HistoricalTradeProvider,
     trade_file: MarketDataFile,
     job: DownloadJob,
@@ -727,6 +758,7 @@ async def aggregate_existing_source(
         trade_file.csv_filename,
         provider=client.slug,
         symbol=trade_file.symbol,
+        ensure_symbol_schema=False,
     )
     update_download_file_row(job, trade_file, status="completed", download_percent=100.0)
     return {
@@ -742,7 +774,7 @@ async def aggregate_existing_source(
 
 
 async def ingest_local_source(
-    engine: Any,
+    engine: AsyncEngine,
     client: HistoricalTradeProvider,
     trade_file: MarketDataFile,
     path: Path,
@@ -764,7 +796,7 @@ async def ingest_local_source(
 
 
 async def import_and_aggregate_source(
-    engine: Any,
+    engine: AsyncEngine,
     client: HistoricalTradeProvider,
     trade_file: MarketDataFile,
     path: Path,
@@ -784,6 +816,7 @@ async def import_and_aggregate_source(
         symbol=trade_file.symbol,
         row_iterator=client.iter_trade_rows,
         progress_callback=on_insert,
+        ensure_symbol_schema=False,
     )
     raise_if_job_cancelled(job)
     update_download_file_row(job, trade_file, status="aggregating")
@@ -792,6 +825,7 @@ async def import_and_aggregate_source(
         import_result.source_file,
         provider=client.slug,
         symbol=import_result.symbol,
+        ensure_symbol_schema=False,
     )
     local_file_deleted = cleanup_downloaded_file(path, output_dir) if cleanup_files else False
     update_download_file_row(job, trade_file, status="completed", download_percent=100.0)
@@ -809,7 +843,7 @@ async def import_and_aggregate_source(
 
 async def download_and_ingest_concurrently(
     client: HistoricalTradeProvider,
-    engine: Any,
+    engine: AsyncEngine,
     work_items: list[IngestWorkItem],
     output_dir: Path,
     *,
@@ -1134,12 +1168,7 @@ def run_async[T](coro: Coroutine[Any, Any, T]) -> T:
 
 
 def provider_cache_options(client: HistoricalTradeProvider) -> tuple[tuple[str, object], ...]:
-    if client.slug == "bybit":
-        return (
-            ("base_url", getattr(client, "base_url", "")),
-            ("timeout", getattr(client, "timeout", 30.0)),
-        )
-    return ()
+    return client.cache_options()
 
 
 def provider_kwargs(options: tuple[tuple[str, object], ...]) -> dict[str, object]:

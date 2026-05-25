@@ -16,7 +16,7 @@ class Base(DeclarativeBase):
     pass
 
 
-class BybitTradeModel(Base):
+class TradeModel(Base):
     __abstract__ = True
 
     ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -33,7 +33,7 @@ class BybitTradeModel(Base):
     ingested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
-class BybitOhlcvModel(Base):
+class OhlcvModel(Base):
     __abstract__ = True
 
     bucket: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -65,7 +65,7 @@ def normalize_provider(provider: str) -> str:
 def symbol_from_source_file(source_file: str) -> str:
     match = SOURCE_FILE_PATTERN.fullmatch(source_file)
     if match is None:
-        raise ValueError(f"Cannot infer symbol from Bybit source file: {source_file}")
+        raise ValueError(f"Cannot infer symbol from source file: {source_file}")
     return normalize_symbol(match.group("symbol"))
 
 
@@ -111,14 +111,14 @@ def symbol_from_identifier_suffix(suffix: str) -> str:
 
 
 @lru_cache(maxsize=None)
-def trade_model_for_symbol(provider: str, symbol: str) -> type[BybitTradeModel]:
+def trade_model_for_symbol(provider: str, symbol: str) -> type[TradeModel]:
     normalized_provider = normalize_provider(provider)
     normalized = normalize_symbol(symbol)
     table_name = table_name_for_symbol(normalized_provider, normalized, "trades")
     class_name = f"{normalized_provider.title().replace('_', '')}Trade{symbol_identifier_suffix(normalized).title().replace('_', '')}"
     return type(
         class_name,
-        (BybitTradeModel,),
+        (TradeModel,),
         {
             "__tablename__": table_name,
             "__module__": __name__,
@@ -132,14 +132,14 @@ def trade_model_for_symbol(provider: str, symbol: str) -> type[BybitTradeModel]:
 
 
 @lru_cache(maxsize=None)
-def ohlcv_model_for_symbol(provider: str, symbol: str) -> type[BybitOhlcvModel]:
+def ohlcv_model_for_symbol(provider: str, symbol: str) -> type[OhlcvModel]:
     normalized_provider = normalize_provider(provider)
     normalized = normalize_symbol(symbol)
     table_name = table_name_for_symbol(normalized_provider, normalized, "ohlcv")
     class_name = f"{normalized_provider.title().replace('_', '')}Ohlcv{symbol_identifier_suffix(normalized).title().replace('_', '')}"
     return type(
         class_name,
-        (BybitOhlcvModel,),
+        (OhlcvModel,),
         {
             "__tablename__": table_name,
             "__module__": __name__,
