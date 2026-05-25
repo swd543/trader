@@ -17,6 +17,7 @@ from trading.models import (
     normalize_symbol,
     ohlcv_table_prefix,
     ohlcv_model_for_symbol,
+    symbol_from_identifier_suffix,
     symbol_from_source_file,
     trade_table_prefix,
     trade_model_for_symbol,
@@ -382,7 +383,7 @@ async def _existing_symbols(conn: AsyncConnection, provider: str) -> list[str]:
             suffixes.add(table_name.removeprefix(trade_prefix))
         elif table_name.startswith(ohlcv_prefix):
             suffixes.add(table_name.removeprefix(ohlcv_prefix))
-    return sorted(suffix.upper() for suffix in suffixes)
+    return sorted(symbol_from_identifier_suffix(suffix) for suffix in suffixes)
 
 
 async def _copy_trade_rows(

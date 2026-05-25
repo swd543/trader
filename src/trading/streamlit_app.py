@@ -29,11 +29,8 @@ def main() -> None:
     st.title("Trading Data Loader")
 
     db_config = sidebar_database_config()
-    provider_slug = st.sidebar.selectbox("Provider", options=provider_names(), format_func=str.title)
-    bybit_base_url = st.sidebar.text_input("Bybit base URL", value="https://public.bybit.com/trading/")
-    timeout = st.sidebar.number_input("HTTP timeout", min_value=5, max_value=180, value=30, step=5)
-
-    client = create_provider(provider_slug, base_url=bybit_base_url, timeout=float(timeout))
+    provider_slug, provider_options = sidebar_provider_config()
+    client = create_provider(provider_slug, **provider_options)
 
     show_database_status(db_config, client.slug)
     st.divider()
@@ -57,6 +54,18 @@ def sidebar_database_config() -> DatabaseConfig:
         user=st.sidebar.text_input("User", value=env_config.user),
         password=st.sidebar.text_input("Password", value=env_config.password, type="password"),
     )
+
+
+def sidebar_provider_config() -> tuple[str, dict[str, object]]:
+    st.sidebar.header("Market Data")
+    selected_provider = st.sidebar.selectbox("Provider", options=provider_names(), format_func=str.title)
+    provider_options: dict[str, object] = {}
+
+    if selected_provider == "bybit":
+        provider_options["base_url"] = st.sidebar.text_input("Bybit base URL", value="https://public.bybit.com/trading/")
+        provider_options["timeout"] = float(st.sidebar.number_input("HTTP timeout", min_value=5, max_value=180, value=30, step=5))
+
+    return selected_provider, provider_options
 
 
 def show_database_status(db_config: DatabaseConfig, provider_slug: str) -> None:
@@ -101,9 +110,8 @@ def render_table_counts(db_config: DatabaseConfig, provider_slug: str) -> None:
 
 def ticker_explorer(client: HistoricalTradeProvider) -> tuple[list[str], date, date]:
     st.subheader("Tickers")
-    controls = st.columns([2, 1, 1])
-    with controls[0]:
-        filter_text = st.text_input("Filter", value="BTC")
+    controls = st.columns([3, 1, 1])
+    provider_options = provider_cache_options(client)
     with controls[1]:
         start = st.date_input("Start", value=date(2020, 3, 25))
     with controls[2]:
@@ -113,13 +121,18 @@ def ticker_explorer(client: HistoricalTradeProvider) -> tuple[list[str], date, d
         cached_symbols.clear()
 
     try:
-        symbols = cached_symbols(client.slug, getattr(client, "base_url", ""), getattr(client, "timeout", 30.0))
+        symbols = cached_symbols(client.slug, provider_options)
     except Exception as error:
         st.error(f"Could not fetch tickers: {error}")
         return [], start, end
 
-    filtered_symbols = [symbol for symbol in symbols if filter_text.upper() in symbol.upper()]
-    selected_symbols = st.multiselect("Symbols", options=filtered_symbols, default=filtered_symbols[:1])
+    with controls[0]:
+        selected_symbols = st.multiselect(
+            "Ticker filter",
+            options=symbols,
+            default=default_symbols(symbols),
+            placeholder="Type to search available tickers",
+        )
 
     if selected_symbols:
         preview_files(client, selected_symbols, start, end)
@@ -129,12 +142,12 @@ def ticker_explorer(client: HistoricalTradeProvider) -> tuple[list[str], date, d
 
 def preview_files(client: HistoricalTradeProvider, selected_symbols: list[str], start: date, end: date) -> None:
     rows: list[dict[str, Any]] = []
+    provider_options = provider_cache_options(client)
     for symbol in selected_symbols:
         try:
             files = cached_trade_files(
                 client.slug,
-                getattr(client, "base_url", ""),
-                getattr(client, "timeout", 30.0),
+                provider_options,
                 symbol,
                 start.isoformat(),
                 end.isoformat(),
@@ -386,21 +399,39 @@ def run_async[T](coro: Coroutine[Any, Any, T]) -> T:
     return asyncio.run(coro)
 
 
+def provider_cache_options(client: HistoricalTradeProvider) -> tuple[tuple[str, object], ...]:
+    if client.slug == "bybit":
+        return (
+            ("base_url", getattr(client, "base_url", "")),
+            ("timeout", getattr(client, "timeout", 30.0)),
+        )
+    return ()
+
+
+def provider_kwargs(options: tuple[tuple[str, object], ...]) -> dict[str, object]:
+    return dict(options)
+
+
+def default_symbols(symbols: list[str]) -> list[str]:
+    if "BTCUSDT" in symbols:
+        return ["BTCUSDT"]
+    return symbols[:1]
+
+
 @st.cache_data(ttl=3600)
-def cached_symbols(provider_slug: str, base_url: str, timeout: float) -> list[str]:
-    return create_provider(provider_slug, base_url=base_url, timeout=timeout).list_symbols()
+def cached_symbols(provider_slug: str, options: tuple[tuple[str, object], ...]) -> list[str]:
+    return create_provider(provider_slug, **provider_kwargs(options)).list_symbols()
 
 
 @st.cache_data(ttl=300)
 def cached_trade_files(
     provider_slug: str,
-    base_url: str,
-    timeout: float,
+    options: tuple[tuple[str, object], ...],
     symbol: str,
     start: str,
     end: str,
 ) -> list[MarketDataFile]:
-    return create_provider(provider_slug, base_url=base_url, timeout=timeout).list_trade_files(
+    return create_provider(provider_slug, **provider_kwargs(options)).list_trade_files(
         symbol,
         start_date=start,
         end_date=end,

@@ -7,7 +7,7 @@ from functools import lru_cache
 from sqlalchemy import BigInteger, DateTime, Float, Index, PrimaryKeyConstraint, String, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
-SYMBOL_PATTERN = re.compile(r"^[A-Z0-9_]+$")
+SYMBOL_PATTERN = re.compile(r"^[A-Z0-9_-]+$")
 PROVIDER_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
 SOURCE_FILE_PATTERN = re.compile(r"(?P<symbol>.+?)(?P<date>\d{4}-\d{2}-\d{2})\.csv$")
 
@@ -79,7 +79,36 @@ def ohlcv_table_prefix(provider: str) -> str:
 
 
 def table_name_for_symbol(provider: str, symbol: str, prefix: str) -> str:
-    return f"{normalize_provider(provider)}_{prefix}_{normalize_symbol(symbol).lower()}"
+    return f"{normalize_provider(provider)}_{prefix}_{symbol_identifier_suffix(symbol)}"
+
+
+def symbol_identifier_suffix(symbol: str) -> str:
+    normalized = normalize_symbol(symbol)
+    parts: list[str] = []
+    for character in normalized:
+        if character == "-":
+            parts.append("_h_")
+        elif character == "_":
+            parts.append("_u_")
+        else:
+            parts.append(character.lower())
+    return "".join(parts)
+
+
+def symbol_from_identifier_suffix(suffix: str) -> str:
+    characters: list[str] = []
+    index = 0
+    while index < len(suffix):
+        if suffix.startswith("_h_", index):
+            characters.append("-")
+            index += 3
+        elif suffix.startswith("_u_", index):
+            characters.append("_")
+            index += 3
+        else:
+            characters.append(suffix[index].upper())
+            index += 1
+    return normalize_symbol("".join(characters))
 
 
 @lru_cache(maxsize=None)
@@ -87,7 +116,7 @@ def trade_model_for_symbol(provider: str, symbol: str) -> type[BybitTradeModel]:
     normalized_provider = normalize_provider(provider)
     normalized = normalize_symbol(symbol)
     table_name = table_name_for_symbol(normalized_provider, normalized, "trades")
-    class_name = f"{normalized_provider.title().replace('_', '')}Trade{normalized}"
+    class_name = f"{normalized_provider.title().replace('_', '')}Trade{symbol_identifier_suffix(normalized).title().replace('_', '')}"
     return type(
         class_name,
         (BybitTradeModel,),
@@ -107,7 +136,7 @@ def ohlcv_model_for_symbol(provider: str, symbol: str) -> type[BybitOhlcvModel]:
     normalized_provider = normalize_provider(provider)
     normalized = normalize_symbol(symbol)
     table_name = table_name_for_symbol(normalized_provider, normalized, "ohlcv")
-    class_name = f"{normalized_provider.title().replace('_', '')}Ohlcv{normalized}"
+    class_name = f"{normalized_provider.title().replace('_', '')}Ohlcv{symbol_identifier_suffix(normalized).title().replace('_', '')}"
     return type(
         class_name,
         (BybitOhlcvModel,),
